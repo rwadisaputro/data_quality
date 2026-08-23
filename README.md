@@ -10,7 +10,7 @@ Backend identification
 Native physical-schema discovery
 ```
 
-It accepts pandas, Polars, and Spark SQL dataframes, preserves the exact object
+It accepts pandas, Polars and Spark SQL dataframes, preserves the exact object
 supplied by the caller, identifies its native execution engine, and discovers:
 
 - Columns in original ordinal order, including duplicate pandas labels.
