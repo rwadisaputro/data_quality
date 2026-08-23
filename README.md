@@ -1,4 +1,4 @@
-# Dataframe intake, backend identification, and physical-schema discovery
+# Dataframe intake, backend identification and physical-schema discovery
 
 This package implements the first three stages of the profiling pipeline:
 
