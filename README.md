@@ -160,7 +160,7 @@ from data_quality import RowCountMode, discover_physical_schema
 
 physical_schema = discover_physical_schema(
     spark_dataframe,
-    row_count_mode=RowCountMode.METADATA_ONLY,
+    row_count_mode = RowCountMode.METADATA_ONLY,
 )
 
 assert physical_schema.shape == (None, len(spark_dataframe.columns))
