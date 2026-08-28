@@ -21,6 +21,7 @@ Requires-Dist: pytest>=8.0; extra == "test"
 Requires-Dist: pytest-cov>=5.0; extra == "test"
 Requires-Dist: mypy>=1.11; extra == "test"
 Requires-Dist: ruff>=0.9; extra == "test"
+Requires-Dist: pandas>=2.2; extra == "test"
 
 # Dataframe intake, backend identification and physical-schema discovery
 

@@ -11,7 +11,10 @@ src/data_quality/backends/base.py
 src/data_quality/backends/builtin.py
 src/data_quality/backends/registry.py
 src/data_quality/cardinality/__init__.py
+src/data_quality/cardinality/hashing.py
 src/data_quality/cardinality/hll.py
+src/data_quality/cardinality/pandas.py
+src/data_quality/cardinality/sketch.py
 src/data_quality/schema_discovery/__init__.py
 src/data_quality/schema_discovery/base.py
 src/data_quality/schema_discovery/builtin.py
