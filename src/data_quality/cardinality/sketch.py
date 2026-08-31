@@ -70,6 +70,12 @@ class HashedHyperLogLog:
 
         return self._hll.is_empty
 
+    @property
+    def zero_register_count(self) -> int:
+        """Return the number of HLL registers that have not been updated."""
+
+        return self._hll.zero_register_count
+
     def add_hash(self, hash_value: int) -> None:
         """Update with a hash already produced by this sketch's configuration."""
 
@@ -79,6 +85,11 @@ class HashedHyperLogLog:
         """Update with hashes already produced by this sketch's configuration."""
 
         self._hll.add_hashes(hash_values)
+
+    def add_hash_array(self, hash_values: object) -> None:
+        """Update from a one-dimensional ndarray of configured 64-bit hashes."""
+
+        self._hll.add_hash_array(hash_values)
 
     def add_canonical_bytes(self, canonical_value: bytes) -> None:
         """Hash one canonical value with this configuration and update the sketch."""

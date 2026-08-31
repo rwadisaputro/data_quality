@@ -447,3 +447,39 @@ def test_classic_estimator_remains_finite_at_maximum_register_rank() -> None:
 
     assert math.isfinite(sketch.estimate())
     assert sketch.estimate() > float(1 << HASH_WIDTH_BITS)
+
+
+def test_add_hash_array_matches_scalar_updates() -> None:
+    import numpy as np
+
+    hashes = np.array([_splitmix64(value) for value in range(10_000)], dtype=np.uint64)
+    bulk = HyperLogLog(precision=12)
+    scalar = HyperLogLog(precision=12)
+
+    bulk.add_hash_array(hashes)
+    scalar.add_hashes(int(value) for value in hashes)
+
+    assert bulk.registers == scalar.registers
+
+
+def test_add_hash_array_rejects_invalid_shapes_and_values() -> None:
+    import numpy as np
+
+    sketch = HyperLogLog(precision=10)
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        sketch.add_hash_array(np.array([[1, 2]], dtype=np.uint64))
+    with pytest.raises(TypeError, match="contain integers"):
+        sketch.add_hash_array(np.array([1.5], dtype=np.float64))
+    with pytest.raises(ValueError, match="negative"):
+        sketch.add_hash_array(np.array([-1], dtype=np.int64))
+
+
+def test_add_hash_array_empty_input_is_noop() -> None:
+    import numpy as np
+
+    sketch = HyperLogLog(precision=10)
+    before = sketch.registers
+    sketch.add_hash_array(np.array([], dtype=np.uint64))
+
+    assert sketch.registers == before

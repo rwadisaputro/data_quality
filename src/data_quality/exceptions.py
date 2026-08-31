@@ -132,3 +132,35 @@ class PhysicalSchemaDiscoveryError(PhysicalSchemaError,
         )
         self.backend_name = backend_name
         self.dataframe_type = dataframe_type
+class CardinalityError(DataQualityError):
+    """Base exception for dataframe cardinality profiling failures."""
+
+
+class DuplicateCardinalityAdapterError(CardinalityError, ValueError):
+    """Raised when more than one cardinality adapter is registered for a backend."""
+
+    def __init__(self, backend_name: str) -> None:
+        super().__init__(
+            f"A cardinality adapter for backend '{backend_name}' is already registered"
+        )
+        self.backend_name = backend_name
+
+
+class UnsupportedCardinalityBackendError(CardinalityError, NotImplementedError):
+    """Raised when a detected backend has no cardinality adapter."""
+
+    def __init__(self, backend_name: str) -> None:
+        super().__init__(f"No cardinality adapter is registered for backend '{backend_name}'")
+        self.backend_name = backend_name
+
+
+class CardinalityProfilingError(CardinalityError, RuntimeError):
+    """Raised when a backend cardinality adapter fails unexpectedly."""
+
+    def __init__(self, backend_name: str, dataframe_type: str) -> None:
+        super().__init__(
+            f"Cardinality profiling failed for backend '{backend_name}' "
+            f"and dataframe type '{dataframe_type}'"
+        )
+        self.backend_name = backend_name
+        self.dataframe_type = dataframe_type

@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 import operator
 from collections.abc import Iterable
+from importlib import import_module
+from typing import Any
 
 
 DEFAULT_PRECISION = 14
@@ -116,6 +118,44 @@ class HyperLogLog:
         for hash_value in hash_values:
             self.add_hash(hash_value)
 
+    def add_hash_array(self, hash_values: object) -> None:
+        """Vectorise register updates from a one-dimensional ``np.uint64`` array.
+
+        NumPy remains optional for the dependency-free HLL core. The dependency is
+        loaded only when this bulk method is used by an array-aware backend adapter.
+        """
+
+        numpy_module = self._load_numpy()
+        values = numpy_module.asarray(hash_values)
+        if values.ndim != 1:
+            raise ValueError("hash_values must be a one-dimensional ndarray")
+        if values.size == 0:
+            return
+
+        if not numpy_module.issubdtype(values.dtype, numpy_module.integer):
+            raise TypeError("hash_values ndarray must contain integers")
+        if numpy_module.issubdtype(values.dtype, numpy_module.signedinteger):
+            if bool((values < 0).any()):
+                raise ValueError("hash_values ndarray cannot contain negative integers")
+
+        values = values.astype(numpy_module.uint64, copy=False)
+        register_indexes = values >> numpy_module.uint64(self._suffix_bits)
+        suffixes = values & numpy_module.uint64(self._suffix_mask)
+
+        powers = numpy_module.left_shift(
+            numpy_module.uint64(1),
+            numpy_module.arange(self._suffix_bits, dtype=numpy_module.uint64),
+        )
+        bit_lengths = numpy_module.searchsorted(powers, suffixes, side="right")
+        ranks = self._suffix_bits - bit_lengths + 1
+
+        registers = numpy_module.frombuffer(self._registers, dtype=numpy_module.uint8)
+        numpy_module.maximum.at(
+            registers,
+            register_indexes.astype(numpy_module.intp, copy=False),
+            ranks.astype(numpy_module.uint8, copy=False),
+        )
+
     def estimate(self) -> float:
         """Return the approximate number of distinct input hashes.
 
@@ -186,6 +226,15 @@ class HyperLogLog:
         if register_count == 64:
             return 0.709
         return 0.7213 / (1.0 + 1.079 / register_count)
+
+    @staticmethod
+    def _load_numpy() -> Any:
+        """Load NumPy only for the optional bulk-update path."""
+
+        try:
+            return import_module("numpy")
+        except ImportError as exc:
+            raise ImportError("Bulk HyperLogLog updates require NumPy") from exc
 
     @staticmethod
     def _coerce_precision(precision: int) -> int:

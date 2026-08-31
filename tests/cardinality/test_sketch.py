@@ -108,3 +108,16 @@ def test_copy_is_independent_and_retains_configuration() -> None:
 
     assert copied.hash_configuration == original.hash_configuration
     assert copied.registers != original.registers
+
+
+def test_add_hash_array_delegates_to_hll_core() -> None:
+    import numpy as np
+
+    values = np.array([hash_scalar(value) for value in ["a", "b", "c", "a"]], dtype=np.uint64)
+    configured = HashedHyperLogLog(precision=10)
+    raw = HyperLogLog(precision=10)
+
+    configured.add_hash_array(values)
+    raw.add_hash_array(values)
+
+    assert configured.registers == raw.registers

@@ -1,14 +1,49 @@
 """Approximate and adaptive cardinality mechanics."""
 
+from data_quality.cardinality.api import (
+    DEFAULT_CARDINALITY_REGISTRY,
+    profile_cardinality,
+    profile_cardinality_from_input,
+    profile_cardinality_json,
+)
+from data_quality.cardinality.base import CardinalityBackendAdapter
+from data_quality.cardinality.builtin import (
+    PandasCardinalityAdapter,
+    builtin_cardinality_adapters,
+)
+from data_quality.cardinality.adaptive import (
+    ALGORITHM_VERSION,
+    DEFAULT_EXACT_MEMORY_BUDGET_BYTES,
+    DEFAULT_EXACT_UNIQUE_THRESHOLD,
+    DEFAULT_MEMORY_SAFETY_FACTOR,
+    DEFAULT_THRESHOLD_CHECK_INTERVAL,
+    RESULT_SCHEMA_VERSION,
+    AdaptiveCardinalityConfig,
+    AdaptiveCardinalityHandler,
+    AdaptiveCardinalityResult,
+    CardinalityMode,
+    PromotionMetadata,
+    PromotionReason,
+)
+from data_quality.cardinality.diagnostics import (
+    CardinalityWarning,
+    CardinalityWarningCode,
+    CardinalityWarningSeverity,
+    UnsupportedCardinalityValueError,
+)
 from data_quality.cardinality.hashing import (
     CANONICALISATION_VERSION,
     DEFAULT_HASH_CONFIGURATION,
     DEFAULT_HASH_SEED,
     HASH_ALGORITHM_ID,
+    HASH_ENGINE_ID,
     NULL_POLICY,
     HashConfiguration,
     canonicalize_scalar,
     hash_canonical_bytes,
+    hash_canonical_ndarray,
+    hash_configuration_for_kernel,
+    hash_ndarray,
     hash_scalar,
 )
 from data_quality.cardinality.hll import (
@@ -20,30 +55,83 @@ from data_quality.cardinality.hll import (
 )
 from data_quality.cardinality.pandas import (
     DEFAULT_PANDAS_CHUNK_SIZE,
+    PandasDtypeFamily,
+    PandasDtypeIdentity,
+    PandasHashKernel,
+    identify_pandas_dtype,
+    iter_pandas_hash_arrays,
     iter_pandas_hashes,
+    pandas_adaptive_cardinality,
+    pandas_adaptive_cardinality_json,
+    pandas_dataframe_cardinality,
     pandas_hll_nunique,
     pandas_hll_sketch,
+)
+from data_quality.cardinality.registry import CardinalityRegistry
+from data_quality.cardinality.report import (
+    DATAFRAME_RESULT_SCHEMA_VERSION,
+    ColumnCardinalityOutcome,
+    DataFrameCardinalityResult,
 )
 from data_quality.cardinality.sketch import HashedHyperLogLog
 
 __all__ = [
+    "ALGORITHM_VERSION",
+    "DEFAULT_CARDINALITY_REGISTRY",
+    "CardinalityBackendAdapter",
+    "CardinalityWarning",
+    "CardinalityWarningCode",
+    "CardinalityWarningSeverity",
+    "ColumnCardinalityOutcome",
+    "DataFrameCardinalityResult",
+    "DATAFRAME_RESULT_SCHEMA_VERSION",
+    "CardinalityRegistry",
+    "PandasCardinalityAdapter",
+    "PandasDtypeFamily",
+    "PandasDtypeIdentity",
+    "PandasHashKernel",
+    "builtin_cardinality_adapters",
+    "identify_pandas_dtype",
+    "profile_cardinality",
+    "profile_cardinality_from_input",
+    "profile_cardinality_json",
     "CANONICALISATION_VERSION",
+    "DEFAULT_EXACT_MEMORY_BUDGET_BYTES",
+    "DEFAULT_EXACT_UNIQUE_THRESHOLD",
     "DEFAULT_HASH_CONFIGURATION",
     "DEFAULT_HASH_SEED",
+    "DEFAULT_MEMORY_SAFETY_FACTOR",
     "DEFAULT_PANDAS_CHUNK_SIZE",
     "DEFAULT_PRECISION",
+    "DEFAULT_THRESHOLD_CHECK_INTERVAL",
     "HASH_ALGORITHM_ID",
+    "HASH_ENGINE_ID",
     "HASH_WIDTH_BITS",
     "MAX_PRECISION",
     "MIN_PRECISION",
     "NULL_POLICY",
+    "RESULT_SCHEMA_VERSION",
+    "AdaptiveCardinalityConfig",
+    "AdaptiveCardinalityHandler",
+    "AdaptiveCardinalityResult",
+    "CardinalityMode",
     "HashConfiguration",
+    "UnsupportedCardinalityValueError",
     "HashedHyperLogLog",
     "HyperLogLog",
+    "PromotionMetadata",
+    "PromotionReason",
     "canonicalize_scalar",
     "hash_canonical_bytes",
+    "hash_canonical_ndarray",
+    "hash_configuration_for_kernel",
+    "hash_ndarray",
     "hash_scalar",
+    "iter_pandas_hash_arrays",
     "iter_pandas_hashes",
+    "pandas_adaptive_cardinality",
+    "pandas_adaptive_cardinality_json",
+    "pandas_dataframe_cardinality",
     "pandas_hll_nunique",
     "pandas_hll_sketch",
 ]

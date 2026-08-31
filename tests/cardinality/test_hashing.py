@@ -11,11 +11,13 @@ from data_quality.cardinality.hashing import (
     DEFAULT_HASH_CONFIGURATION,
     DEFAULT_HASH_SEED,
     HASH_ALGORITHM_ID,
+    HASH_ENGINE_ID,
     HASH_WIDTH_BITS,
     NULL_POLICY,
     HashConfiguration,
     canonicalize_scalar,
     hash_canonical_bytes,
+    hash_canonical_ndarray,
     hash_scalar,
 )
 
@@ -23,12 +25,14 @@ from data_quality.cardinality.hashing import (
 def test_hash_metadata_is_explicit_and_versioned() -> None:
     configuration = DEFAULT_HASH_CONFIGURATION
 
-    assert HASH_ALGORITHM_ID == "blake2b-64"
+    assert HASH_ALGORITHM_ID == "pandas-dtype-kernel-64-v2"
+    assert HASH_ENGINE_ID == "pandas.util.hash_array+splitmix64"
     assert HASH_WIDTH_BITS == 64
     assert DEFAULT_HASH_SEED == 0
-    assert CANONICALISATION_VERSION == "scalar-v1"
+    assert CANONICALISATION_VERSION == "pandas-dtype-kernels-v2"
     assert NULL_POLICY == "exclude"
     assert configuration.algorithm_id == HASH_ALGORITHM_ID
+    assert configuration.engine_id == HASH_ENGINE_ID
     assert configuration.width_bits == HASH_WIDTH_BITS
     assert configuration.canonicalisation_version == CANONICALISATION_VERSION
     assert configuration.null_policy == NULL_POLICY
@@ -158,12 +162,12 @@ def test_hash_values_fit_unsigned_64_bit_range() -> None:
 
 
 def test_stable_hash_vectors() -> None:
-    assert hash_scalar(False) == 3606156896556832493
-    assert hash_scalar(True) == 11865779955920784198
-    assert hash_scalar(1) == 15101364931221201302
-    assert hash_scalar(1.5) == 8054707647953756233
-    assert hash_scalar("abc") == 3374760310982613762
-    assert hash_scalar(b"abc") == 3543020399631637251
+    assert hash_scalar(False) == 13523928325204652336
+    assert hash_scalar(True) == 3503252267930221076
+    assert hash_scalar(1) == 3600679870756998109
+    assert hash_scalar(1.5) == 12480509705983363768
+    assert hash_scalar("abc") == 13727073273513852047
+    assert hash_scalar(b"abc") == 683284965577791299
 
 
 def test_complex_values_are_type_aware_and_normalize_signed_zero() -> None:
@@ -174,3 +178,71 @@ def test_complex_values_are_type_aware_and_normalize_signed_zero() -> None:
 def test_complex_nan_is_rejected() -> None:
     with pytest.raises(ValueError, match="Complex NaN"):
         canonicalize_scalar(complex(float("nan"), 1.0))
+
+
+def test_hash_canonical_ndarray_returns_uint64_array() -> None:
+    import numpy as np
+
+    canonical = np.array([canonicalize_scalar(1), canonicalize_scalar("1")], dtype=object)
+    hashes = hash_canonical_ndarray(canonical)
+
+    assert isinstance(hashes, np.ndarray)
+    assert hashes.dtype == np.uint64
+    assert hashes.shape == (2,)
+    assert int(hashes[0]) == hash_scalar(1)
+    assert int(hashes[1]) == hash_scalar("1")
+
+
+def test_hash_canonical_ndarray_rejects_non_bytes() -> None:
+    import numpy as np
+
+    with pytest.raises(TypeError, match="only bytes"):
+        hash_canonical_ndarray(np.array([b"ok", "not-bytes"], dtype=object))
+
+
+def test_hash_configuration_serializes_all_hash_parameters() -> None:
+    metadata = HashConfiguration(seed=99).as_dict()
+
+    assert metadata == {
+        "algorithm_id": HASH_ALGORITHM_ID,
+        "engine_id": HASH_ENGINE_ID,
+        "width_bits": HASH_WIDTH_BITS,
+        "seed": 99,
+        "canonicalisation_version": CANONICALISATION_VERSION,
+        "null_policy": NULL_POLICY,
+    }
+
+
+def test_hash_configuration_can_describe_future_backend_hash_engines() -> None:
+    configuration = HashConfiguration(
+        algorithm_id="future-backend-hash-v1",
+        engine_id="future.ndarray.hash",
+    )
+
+    assert configuration.algorithm_id == "future-backend-hash-v1"
+    assert configuration.engine_id == "future.ndarray.hash"
+
+
+def test_pandas_ndarray_hasher_rejects_mismatched_engine_metadata() -> None:
+    import numpy as np
+
+    configuration = HashConfiguration(
+        algorithm_id="future-backend-hash-v1",
+        engine_id="future.ndarray.hash",
+    )
+    canonical = np.array([canonicalize_scalar(1)], dtype=object)
+
+    with pytest.raises(ValueError, match="configured pandas ndarray hash engine"):
+        hash_canonical_ndarray(canonical, configuration=configuration)
+
+
+def test_hash_configuration_rejects_non_64_bit_width_and_incompatible_null_policy() -> None:
+    with pytest.raises(ValueError, match="64 bits"):
+        HashConfiguration(width_bits=32)
+    with pytest.raises(ValueError, match="null policy"):
+        HashConfiguration(null_policy="include")
+
+
+def test_hash_configuration_rejects_empty_metadata_identifiers() -> None:
+    with pytest.raises(TypeError, match="algorithm_id"):
+        HashConfiguration(algorithm_id="")
