@@ -6,7 +6,10 @@ import json
 from dataclasses import dataclass
 
 from data_quality.cardinality.adaptive import AdaptiveCardinalityResult
-from data_quality.cardinality.diagnostics import CardinalityWarning
+from data_quality.cardinality.diagnostics import (
+    CardinalityWarning,
+    json_safe_metadata_value,
+)
 
 DATAFRAME_RESULT_SCHEMA_VERSION = "dataframe-cardinality-v1"
 
@@ -36,7 +39,7 @@ class ColumnCardinalityOutcome:
         """Return a JSON-safe per-column payload."""
 
         return {
-            "column": _json_safe_value(self.column),
+            "column": json_safe_metadata_value(self.column),
             "position": self.position,
             "status": self.status,
             "result": None if self.result is None else self.result.as_dict(),
@@ -84,8 +87,3 @@ class DataFrameCardinalityResult:
 
         return json.dumps(self.as_dict(), indent=indent, sort_keys=True)
 
-
-def _json_safe_value(value: object) -> object:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    return repr(value)

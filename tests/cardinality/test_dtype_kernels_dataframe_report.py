@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import data_quality.cardinality.pandas as pandas_impl
+import data_quality.cardinality.pandas_backend as pandas_impl
 from data_quality import (
     AdaptiveCardinalityConfig,
     CardinalityProfilingError,
@@ -107,6 +107,92 @@ def test_homogeneous_dtype_kernels_never_use_scalar_fallback(
     assert result.warnings == ()
 
 
+def test_signed_and_unsigned_integer_kernels_are_distinct_without_int64_coercion() -> None:
+    signed = _frame(pd.Series([1, 2, 3], dtype="int64"))
+    unsigned = _frame(
+        pd.Series([2**63 + 1, 2**63 + 2, 2**63 + 1], dtype="UInt64")
+    )
+
+    signed_result = pandas_adaptive_cardinality(signed, "value")
+    unsigned_result = pandas_adaptive_cardinality(unsigned, "value")
+
+    assert signed_result.lineage["column"]["integer_signedness"] == "signed"
+    assert unsigned_result.lineage["column"]["integer_signedness"] == "unsigned"
+    assert signed_result.lineage["hash_kernel"]["kernel_id"] == "pandas-signed-integer-v2"
+    assert unsigned_result.lineage["hash_kernel"]["kernel_id"] == "pandas-unsigned-integer-v2"
+    assert unsigned_result.distinct_count == 2
+
+    signed_sketch = pandas_hll_sketch(signed, "value")
+    unsigned_small = _frame(pd.Series([1, 2, 3], dtype="uint64"))
+    unsigned_sketch = pandas_hll_sketch(unsigned_small, "value")
+    assert signed_sketch.hash_configuration != unsigned_sketch.hash_configuration
+    with pytest.raises(ValueError, match="different hash configurations"):
+        signed_sketch.merge(unsigned_sketch)
+
+
+def test_temporal_kernels_normalize_supported_units_to_nanoseconds() -> None:
+    expected_datetime = np.array(
+        [1577836800000000000, 1577923200000000000],
+        dtype=np.int64,
+    )
+    for unit in ("s", "ms", "us", "ns"):
+        series = pd.Series(
+            np.array(["2020-01-01", "2020-01-02"], dtype=f"datetime64[{unit}]")
+        )
+        identity = pandas_impl.identify_pandas_dtype(series.dtype)
+        arrays = list(
+            pandas_impl._iter_pandas_canonical_arrays(
+                series,
+                chunk_size=8,
+                dtype_identity=identity,
+            )
+        )
+        assert len(arrays) == 1
+        tokens, _, null_count = arrays[0]
+        assert null_count == 0
+        assert np.array_equal(tokens, expected_datetime)
+
+    for unit, multiplier in (("s", 1_000_000_000), ("ms", 1_000_000), ("us", 1_000), ("ns", 1)):
+        series = pd.Series(np.array([1, 2], dtype=f"timedelta64[{unit}]"))
+        identity = pandas_impl.identify_pandas_dtype(series.dtype)
+        tokens, _, _ = next(
+            pandas_impl._iter_pandas_canonical_arrays(
+                series,
+                chunk_size=8,
+                dtype_identity=identity,
+            )
+        )
+        assert tokens.tolist() == [multiplier, 2 * multiplier]
+
+
+def test_object_numpy_unsigned_scalar_remains_distinct_from_signed_integer() -> None:
+    dataframe = _frame(pd.Series([np.int64(1), np.uint64(1)], dtype=object))
+    result = pandas_adaptive_cardinality(dataframe, "value")
+    assert result.distinct_count == 2
+
+
+def test_pandas_null_count_reuses_chunk_masks_without_second_full_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataframe = _frame(pd.Series([1, None, 2, None, 3], dtype="Int64"))
+    original_isna = pd.Series.isna
+    lengths: list[int] = []
+
+    def tracking_isna(series: pd.Series) -> pd.Series:
+        lengths.append(len(series))
+        return original_isna(series)
+
+    monkeypatch.setattr(pd.Series, "isna", tracking_isna)
+    result = pandas_adaptive_cardinality(
+        dataframe,
+        "value",
+        chunk_size=2,
+    )
+
+    assert result.null_count == 2
+    assert lengths == [2, 2, 1]
+
+
 def test_object_dtype_uses_structured_scalar_fallback_warning() -> None:
     dataframe = _frame(pd.Series([1, True, 1.0, "1"], dtype="object"))
     result = pandas_adaptive_cardinality(dataframe, "value")
@@ -119,6 +205,49 @@ def test_object_dtype_uses_structured_scalar_fallback_warning() -> None:
     assert warning.severity is CardinalityWarningSeverity.PERFORMANCE
     assert warning.context["column"] == "value"
     assert result.as_dict()["warnings"][0]["code"] == "scalar_canonicalization_fallback"
+
+
+def test_categorical_private_tokenization_builds_lookup_without_repr() -> None:
+    categorical = pd.Categorical(
+        ["a", "b", "a"],
+        categories=["b", "a"],
+        ordered=True,
+    )
+    dtype_identity = pandas_impl.identify_pandas_dtype(categorical.dtype)
+
+    tokens = pandas_impl._canonicalize_pandas_ndarray(
+        categorical,
+        dtype_identity=dtype_identity,
+        pandas_module=pd,
+        numpy_module=np,
+        row_positions=np.array([0, 1, 2], dtype=np.int64),
+        column="value",
+        native_dtype=categorical.dtype,
+    )
+
+    assert tokens.tolist() == [b"sa", b"sb", b"sa"]
+
+
+def test_unsupported_categorical_value_reports_first_used_row() -> None:
+    class UnsupportedCategory:
+        pass
+
+    value = UnsupportedCategory()
+    dataframe = _frame(
+        pd.Series(
+            pd.Categorical(
+                [value, value],
+                categories=[value],
+            )
+        )
+    )
+
+    with pytest.raises(UnsupportedCardinalityValueError) as exc_info:
+        pandas_adaptive_cardinality(dataframe, "value")
+
+    payload = exc_info.value.as_dict()
+    assert payload["context"]["row_position"] == 0
+    assert payload["context"]["scalar_type"].endswith("UnsupportedCategory")
 
 
 def test_unsupported_object_scalar_has_structured_failure_and_row_position() -> None:
@@ -234,15 +363,27 @@ def test_hash_ndarray_validation_and_empty_array() -> None:
 
 
 def test_hash_configuration_for_kernel_validation_and_metadata() -> None:
-    configured = hash_configuration_for_kernel(HashConfiguration(seed=9), kernel_id="float-v1")
+    configured = hash_configuration_for_kernel(
+        HashConfiguration(seed=9),
+        kernel_id="float-v1",
+        runtime_version="2.2-test",
+    )
     assert configured.seed == 9
-    assert configured.canonicalisation_version.endswith(";kernel=float-v1")
+    assert configured.canonicalisation_version == "pandas-dtype-kernels-v3"
+    assert configured.runtime_id == "pandas"
+    assert configured.runtime_version == "2.2-test"
+    assert configured.kernel_id == "float-v1"
+    assert hash_configuration_for_kernel(
+        configured,
+        kernel_id="float-v1",
+        runtime_version="2.2-test",
+    ) is configured
 
     with pytest.raises(TypeError, match="HashConfiguration"):
         hash_configuration_for_kernel(object(), kernel_id="x")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="kernel_id"):
         hash_configuration_for_kernel(HashConfiguration(), kernel_id="")
-    with pytest.raises(ValueError, match="configured pandas ndarray hash engine"):
+    with pytest.raises(ValueError, match="supported base hash contract"):
         hash_configuration_for_kernel(
             HashConfiguration(algorithm_id="other", engine_id="other"),
             kernel_id="x",
@@ -276,7 +417,7 @@ def test_report_models_expose_attributes_and_json_safe_non_string_column() -> No
     assert report.unsupported_column_count == 2
     assert report.warnings == (warning,)
     payload = json.loads(report.to_json(indent=None))
-    assert payload["columns"][0]["column"] == "('multi', 'label')"
+    assert payload["columns"][0]["column"] == ["multi", "label"]
 
 
 @dataclass
@@ -335,7 +476,10 @@ def test_temporal_private_kernels_cover_plain_ndarray_fallback_shapes() -> None:
         pandas_module=pd,
         numpy_module=np,
     )
-    assert period_tokens.tolist() == [648, 649]
+    assert period_tokens.tolist() == [
+        pd.Timestamp("2024-01-01").value,
+        pd.Timestamp("2024-02-01").value,
+    ]
 
     datetime_identity = pandas_impl.PandasDtypeIdentity(
         family=PandasDtypeFamily.DATETIME,
@@ -386,7 +530,7 @@ def test_structured_unsupported_error_json_safes_nonprimitive_column_label() -> 
         row_position=None,
         value=[1],
     )
-    assert error.as_dict()["context"]["column"] == "('group', 'value')"
+    assert error.as_dict()["context"]["column"] == ["group", "value"]
 
 
 @dataclass
@@ -412,4 +556,50 @@ def test_adaptive_exact_memory_measure_handles_empty_native_array() -> None:
     from data_quality.cardinality import AdaptiveCardinalityHandler
 
     handler = AdaptiveCardinalityHandler()
+    assert handler._measure_exact_state_bytes(None) == 0
     assert handler._measure_exact_state_bytes(np.array([], dtype=np.int64)) == 0
+    assert np.array_equal(
+        handler._merge_sorted_unique(
+            np.array([1, 2], dtype=np.int64),
+            np.array([], dtype=np.int64),
+        ),
+        np.array([1, 2], dtype=np.int64),
+    )
+
+
+def test_json_safe_metadata_never_calls_custom_repr() -> None:
+    from data_quality.cardinality.diagnostics import json_safe_metadata_value
+
+    class ExplosiveRepr:
+        def __repr__(self) -> str:
+            raise AssertionError("repr must not be called")
+
+    value = ExplosiveRepr()
+    assert json_safe_metadata_value([value]) == [
+        {
+            "type": (
+                "test_dtype_kernels_dataframe_report."
+                "test_json_safe_metadata_never_calls_custom_repr.<locals>.ExplosiveRepr"
+            ),
+            "serialization": "omitted",
+        }
+    ]
+    assert json_safe_metadata_value({"x": b"abc", object(): "ignored"}) == {
+        "x": {"type": "bytes", "length": 3}
+    }
+
+
+def test_temporal_private_kernel_timedelta_plain_array_fallback_is_nanoseconds() -> None:
+    identity = pandas_impl.PandasDtypeIdentity(
+        family=PandasDtypeFamily.TIMEDELTA,
+        numpy_kind="O",
+        is_extension_dtype=False,
+        canonicalisation_strategy="test",
+    )
+    tokens = pandas_impl._canonicalize_pandas_ndarray(
+        np.array([pd.Timedelta(seconds=1), pd.Timedelta(seconds=2)], dtype=object),
+        dtype_identity=identity,
+        pandas_module=pd,
+        numpy_module=np,
+    )
+    assert tokens.tolist() == [1_000_000_000, 2_000_000_000]

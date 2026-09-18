@@ -156,6 +156,43 @@ class HyperLogLog:
             ranks.astype(numpy_module.uint8, copy=False),
         )
 
+    def add_register_array(
+        self,
+        register_indexes: object,
+        ranks: object,
+    ) -> None:
+        """Merge pre-aggregated register/rank arrays into this sketch.
+
+        Distributed backends can compute ``max(rho)`` per register natively and
+        transfer only those compact register summaries back to Python.
+        """
+
+        numpy_module = self._load_numpy()
+        indexes = numpy_module.asarray(register_indexes)
+        rank_values = numpy_module.asarray(ranks)
+        if indexes.ndim != 1 or rank_values.ndim != 1:
+            raise ValueError("register_indexes and ranks must be one-dimensional ndarrays")
+        if len(indexes) != len(rank_values):
+            raise ValueError("register_indexes and ranks must have the same length")
+        if indexes.size == 0:
+            return
+        if not numpy_module.issubdtype(indexes.dtype, numpy_module.integer):
+            raise TypeError("register_indexes ndarray must contain integers")
+        if not numpy_module.issubdtype(rank_values.dtype, numpy_module.integer):
+            raise TypeError("ranks ndarray must contain integers")
+        if bool((indexes < 0).any()) or bool((indexes >= self.register_count).any()):
+            raise ValueError("register_indexes contain an out-of-range register")
+        max_rank = self._suffix_bits + 1
+        if bool((rank_values < 0).any()) or bool((rank_values > max_rank).any()):
+            raise ValueError(f"ranks must be between 0 and {max_rank}")
+
+        registers = numpy_module.frombuffer(self._registers, dtype=numpy_module.uint8)
+        numpy_module.maximum.at(
+            registers,
+            indexes.astype(numpy_module.intp, copy=False),
+            rank_values.astype(numpy_module.uint8, copy=False),
+        )
+
     def estimate(self) -> float:
         """Return the approximate number of distinct input hashes.
 

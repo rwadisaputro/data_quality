@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from uuid import UUID
 
 import pytest
@@ -12,12 +12,15 @@ from data_quality.cardinality.hashing import (
     DEFAULT_HASH_SEED,
     HASH_ALGORITHM_ID,
     HASH_ENGINE_ID,
+    HASH_RUNTIME_ID,
     HASH_WIDTH_BITS,
     NULL_POLICY,
     HashConfiguration,
+    bind_hash_configuration,
     canonicalize_scalar,
     hash_canonical_bytes,
     hash_canonical_ndarray,
+    hash_configuration_for_kernel,
     hash_scalar,
 )
 
@@ -29,13 +32,17 @@ def test_hash_metadata_is_explicit_and_versioned() -> None:
     assert HASH_ENGINE_ID == "pandas.util.hash_array+splitmix64"
     assert HASH_WIDTH_BITS == 64
     assert DEFAULT_HASH_SEED == 0
-    assert CANONICALISATION_VERSION == "pandas-dtype-kernels-v2"
+    assert CANONICALISATION_VERSION == "pandas-dtype-kernels-v3"
     assert NULL_POLICY == "exclude"
     assert configuration.algorithm_id == HASH_ALGORITHM_ID
     assert configuration.engine_id == HASH_ENGINE_ID
     assert configuration.width_bits == HASH_WIDTH_BITS
     assert configuration.canonicalisation_version == CANONICALISATION_VERSION
     assert configuration.null_policy == NULL_POLICY
+    assert configuration.runtime_id is None
+    assert configuration.runtime_version is None
+    assert configuration.kernel_id is None
+    assert configuration.is_bound is False
 
 
 def test_hash_configuration_accepts_integer_like_seed() -> None:
@@ -78,9 +85,20 @@ def test_unicode_is_preserved_without_normalization() -> None:
     assert canonicalize_scalar("é") != canonicalize_scalar("e\u0301")
 
 
-def test_decimal_equal_values_share_canonical_form() -> None:
+def test_decimal_equal_values_share_context_independent_canonical_form() -> None:
+    assert canonicalize_scalar(Decimal("1.2300")) == b"d0:123:-2"
+    assert canonicalize_scalar(Decimal("1.23")) == b"d0:123:-2"
     assert canonicalize_scalar(Decimal("1.0")) == canonicalize_scalar(Decimal("1.00"))
     assert canonicalize_scalar(Decimal("-0")) == canonicalize_scalar(Decimal("0"))
+
+    value = Decimal("12345.000")
+    with localcontext() as context:
+        context.prec = 2
+        low_precision = canonicalize_scalar(value)
+    with localcontext() as context:
+        context.prec = 50
+        high_precision = canonicalize_scalar(value)
+    assert low_precision == high_precision == b"d0:12345:0"
 
 
 def test_aware_datetimes_are_normalized_to_utc() -> None:
@@ -210,6 +228,10 @@ def test_hash_configuration_serializes_all_hash_parameters() -> None:
         "seed": 99,
         "canonicalisation_version": CANONICALISATION_VERSION,
         "null_policy": NULL_POLICY,
+        "runtime_id": None,
+        "runtime_version": None,
+        "kernel_id": None,
+        "is_bound": False,
     }
 
 
@@ -232,8 +254,77 @@ def test_pandas_ndarray_hasher_rejects_mismatched_engine_metadata() -> None:
     )
     canonical = np.array([canonicalize_scalar(1)], dtype=object)
 
-    with pytest.raises(ValueError, match="configured pandas ndarray hash engine"):
+    with pytest.raises(ValueError, match="supported base hash contract"):
         hash_canonical_ndarray(canonical, configuration=configuration)
+
+
+
+def test_hash_configuration_binding_contract_is_idempotent_and_strict() -> None:
+    base = HashConfiguration(seed=7)
+    bound = hash_configuration_for_kernel(
+        base,
+        kernel_id="pandas-signed-integer-v2",
+        runtime_version="2.2-test",
+    )
+
+    assert bound.is_bound is True
+    assert bound.runtime_id == HASH_RUNTIME_ID
+    assert bound.runtime_version == "2.2-test"
+    assert bound.kernel_id == "pandas-signed-integer-v2"
+    assert hash_configuration_for_kernel(
+        bound,
+        kernel_id="pandas-signed-integer-v2",
+        runtime_version="2.2-test",
+    ) is bound
+
+    with pytest.raises(ValueError, match="another kernel"):
+        hash_configuration_for_kernel(
+            bound,
+            kernel_id="pandas-unsigned-integer-v2",
+            runtime_version="2.2-test",
+        )
+
+    with pytest.raises(ValueError, match="runtime version"):
+        hash_configuration_for_kernel(
+            bound,
+            kernel_id="pandas-signed-integer-v2",
+            runtime_version="2.3-test",
+        )
+
+
+def test_hash_configuration_binding_rejects_unsupported_canonicalisation_version() -> None:
+    configuration = HashConfiguration(canonicalisation_version="unsupported-v999")
+
+    with pytest.raises(ValueError, match="unsupported canonicalisation version"):
+        hash_configuration_for_kernel(
+            configuration,
+            kernel_id="pandas-signed-integer-v2",
+            runtime_version="2.2-test",
+        )
+
+
+def test_hash_configuration_binding_rejects_another_recorded_runtime() -> None:
+    polars_bound = bind_hash_configuration(
+        HashConfiguration(seed=3),
+        runtime_id="polars",
+        runtime_version="1.99-test",
+        algorithm_id="polars-hash-v1",
+        engine_id="polars.Series.hash",
+        canonicalisation_version="polars-kernels-v1",
+        kernel_id="polars-int64-v1",
+    )
+
+    with pytest.raises(ValueError, match="another hashing runtime"):
+        hash_configuration_for_kernel(
+            polars_bound,
+            kernel_id="pandas-signed-integer-v2",
+            runtime_version="2.2-test",
+        )
+
+
+def test_hash_configuration_requires_complete_runtime_binding_metadata() -> None:
+    with pytest.raises(ValueError, match="recorded together"):
+        HashConfiguration(runtime_id="pandas")
 
 
 def test_hash_configuration_rejects_non_64_bit_width_and_incompatible_null_policy() -> None:
@@ -246,3 +337,99 @@ def test_hash_configuration_rejects_non_64_bit_width_and_incompatible_null_polic
 def test_hash_configuration_rejects_empty_metadata_identifiers() -> None:
     with pytest.raises(TypeError, match="algorithm_id"):
         HashConfiguration(algorithm_id="")
+
+
+def test_bound_hash_configuration_rejects_changed_contract_fields() -> None:
+    bound = hash_configuration_for_kernel(
+        HashConfiguration(),
+        kernel_id="kernel-a",
+        runtime_version="2.2-test",
+    )
+
+    changed_canonical = HashConfiguration(
+        seed=bound.seed,
+        algorithm_id=bound.algorithm_id,
+        engine_id=bound.engine_id,
+        width_bits=bound.width_bits,
+        canonicalisation_version="other-canonical-v1",
+        null_policy=bound.null_policy,
+        runtime_id=bound.runtime_id,
+        runtime_version=bound.runtime_version,
+        kernel_id=bound.kernel_id,
+    )
+    with pytest.raises(ValueError, match="unsupported canonicalisation"):
+        bind_hash_configuration(
+            changed_canonical,
+            runtime_id="pandas",
+            runtime_version="2.2-test",
+            algorithm_id=HASH_ALGORITHM_ID,
+            engine_id=HASH_ENGINE_ID,
+            canonicalisation_version=CANONICALISATION_VERSION,
+            kernel_id="kernel-a",
+        )
+
+    changed_engine = HashConfiguration(
+        seed=bound.seed,
+        algorithm_id="other-algorithm",
+        engine_id="other-engine",
+        width_bits=bound.width_bits,
+        canonicalisation_version=CANONICALISATION_VERSION,
+        null_policy=bound.null_policy,
+        runtime_id=bound.runtime_id,
+        runtime_version=bound.runtime_version,
+        kernel_id=bound.kernel_id,
+    )
+    with pytest.raises(ValueError, match="another hashing engine"):
+        bind_hash_configuration(
+            changed_engine,
+            runtime_id="pandas",
+            runtime_version="2.2-test",
+            algorithm_id=HASH_ALGORITHM_ID,
+            engine_id=HASH_ENGINE_ID,
+            canonicalisation_version=CANONICALISATION_VERSION,
+            kernel_id="kernel-a",
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["runtime_id", "runtime_version", "kernel_id"],
+)
+def test_hash_configuration_rejects_empty_optional_binding_identifier(field: str) -> None:
+    kwargs = {
+        "runtime_id": "pandas",
+        "runtime_version": "2.2-test",
+        "kernel_id": "kernel-a",
+    }
+    kwargs[field] = ""
+    with pytest.raises(TypeError, match=field):
+        HashConfiguration(**kwargs)
+
+
+def test_bind_hash_configuration_validates_configuration_and_requested_identifiers() -> None:
+    with pytest.raises(TypeError, match="HashConfiguration"):
+        bind_hash_configuration(  # type: ignore[arg-type]
+            object(),
+            runtime_id="pandas",
+            runtime_version="2.2-test",
+            algorithm_id=HASH_ALGORITHM_ID,
+            engine_id=HASH_ENGINE_ID,
+            canonicalisation_version=CANONICALISATION_VERSION,
+            kernel_id="kernel-a",
+        )
+
+    with pytest.raises(TypeError, match="runtime_id"):
+        bind_hash_configuration(
+            HashConfiguration(),
+            runtime_id="",
+            runtime_version="2.2-test",
+            algorithm_id=HASH_ALGORITHM_ID,
+            engine_id=HASH_ENGINE_ID,
+            canonicalisation_version=CANONICALISATION_VERSION,
+            kernel_id="kernel-a",
+        )
+
+
+def test_decimal_infinities_have_stable_non_arithmetic_encoding() -> None:
+    assert canonicalize_scalar(Decimal("Infinity")) == b"d0:inf"
+    assert canonicalize_scalar(Decimal("-Infinity")) == b"d1:inf"

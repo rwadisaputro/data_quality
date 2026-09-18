@@ -9,6 +9,8 @@ from data_quality.cardinality.api import (
 from data_quality.cardinality.base import CardinalityBackendAdapter
 from data_quality.cardinality.builtin import (
     PandasCardinalityAdapter,
+    PolarsCardinalityAdapter,
+    PySparkCardinalityAdapter,
     builtin_cardinality_adapters,
 )
 from data_quality.cardinality.adaptive import (
@@ -29,7 +31,9 @@ from data_quality.cardinality.diagnostics import (
     CardinalityWarning,
     CardinalityWarningCode,
     CardinalityWarningSeverity,
+    UnsupportedCardinalityDtypeError,
     UnsupportedCardinalityValueError,
+    driver_stream_fallback_warning,
 )
 from data_quality.cardinality.hashing import (
     CANONICALISATION_VERSION,
@@ -37,8 +41,10 @@ from data_quality.cardinality.hashing import (
     DEFAULT_HASH_SEED,
     HASH_ALGORITHM_ID,
     HASH_ENGINE_ID,
+    HASH_RUNTIME_ID,
     NULL_POLICY,
     HashConfiguration,
+    bind_hash_configuration,
     canonicalize_scalar,
     hash_canonical_bytes,
     hash_canonical_ndarray,
@@ -53,7 +59,7 @@ from data_quality.cardinality.hll import (
     MIN_PRECISION,
     HyperLogLog,
 )
-from data_quality.cardinality.pandas import (
+from data_quality.cardinality.pandas_backend import (
     DEFAULT_PANDAS_CHUNK_SIZE,
     PandasDtypeFamily,
     PandasDtypeIdentity,
@@ -66,6 +72,32 @@ from data_quality.cardinality.pandas import (
     pandas_dataframe_cardinality,
     pandas_hll_nunique,
     pandas_hll_sketch,
+)
+from data_quality.cardinality.polars_backend import (
+    DEFAULT_POLARS_BATCH_SIZE,
+    POLARS_CANONICALISATION_VERSION,
+    POLARS_HASH_ALGORITHM_ID,
+    POLARS_HASH_ENGINE_ID,
+    POLARS_HASH_RUNTIME_ID,
+    PolarsDtypeFamily,
+    PolarsDtypeIdentity,
+    PolarsHashKernel,
+    identify_polars_dtype,
+    polars_adaptive_cardinality,
+    polars_dataframe_cardinality,
+)
+from data_quality.cardinality.pyspark_backend import (
+    DEFAULT_PYSPARK_BATCH_SIZE,
+    PYSPARK_CANONICALISATION_VERSION,
+    PYSPARK_HASH_ALGORITHM_ID,
+    PYSPARK_HASH_ENGINE_ID,
+    PYSPARK_HASH_RUNTIME_ID,
+    PySparkDtypeFamily,
+    PySparkDtypeIdentity,
+    PySparkHashKernel,
+    identify_pyspark_dtype,
+    pyspark_adaptive_cardinality,
+    pyspark_dataframe_cardinality,
 )
 from data_quality.cardinality.registry import CardinalityRegistry
 from data_quality.cardinality.report import (
@@ -106,6 +138,7 @@ __all__ = [
     "DEFAULT_THRESHOLD_CHECK_INTERVAL",
     "HASH_ALGORITHM_ID",
     "HASH_ENGINE_ID",
+    "HASH_RUNTIME_ID",
     "HASH_WIDTH_BITS",
     "MAX_PRECISION",
     "MIN_PRECISION",
@@ -121,6 +154,7 @@ __all__ = [
     "HyperLogLog",
     "PromotionMetadata",
     "PromotionReason",
+    "bind_hash_configuration",
     "canonicalize_scalar",
     "hash_canonical_bytes",
     "hash_canonical_ndarray",
@@ -134,4 +168,30 @@ __all__ = [
     "pandas_dataframe_cardinality",
     "pandas_hll_nunique",
     "pandas_hll_sketch",
+    "PolarsCardinalityAdapter",
+    "PySparkCardinalityAdapter",
+    "PolarsDtypeFamily",
+    "PolarsDtypeIdentity",
+    "PolarsHashKernel",
+    "PySparkDtypeFamily",
+    "PySparkDtypeIdentity",
+    "PySparkHashKernel",
+    "DEFAULT_POLARS_BATCH_SIZE",
+    "DEFAULT_PYSPARK_BATCH_SIZE",
+    "POLARS_CANONICALISATION_VERSION",
+    "POLARS_HASH_ALGORITHM_ID",
+    "POLARS_HASH_ENGINE_ID",
+    "POLARS_HASH_RUNTIME_ID",
+    "PYSPARK_CANONICALISATION_VERSION",
+    "PYSPARK_HASH_ALGORITHM_ID",
+    "PYSPARK_HASH_ENGINE_ID",
+    "PYSPARK_HASH_RUNTIME_ID",
+    "identify_polars_dtype",
+    "identify_pyspark_dtype",
+    "polars_adaptive_cardinality",
+    "polars_dataframe_cardinality",
+    "pyspark_adaptive_cardinality",
+    "pyspark_dataframe_cardinality",
+    "UnsupportedCardinalityDtypeError",
+    "driver_stream_fallback_warning",
 ]

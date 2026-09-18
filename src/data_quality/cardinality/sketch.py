@@ -91,6 +91,15 @@ class HashedHyperLogLog:
 
         self._hll.add_hash_array(hash_values)
 
+    def add_register_array(
+        self,
+        register_indexes: object,
+        ranks: object,
+    ) -> None:
+        """Merge backend-preaggregated register maxima into the sketch."""
+
+        self._hll.add_register_array(register_indexes, ranks)
+
     def add_canonical_bytes(self, canonical_value: bytes) -> None:
         """Hash one canonical value with this configuration and update the sketch."""
 

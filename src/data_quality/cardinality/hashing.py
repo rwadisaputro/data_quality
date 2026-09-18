@@ -20,9 +20,10 @@ from uuid import UUID
 
 HASH_ALGORITHM_ID = "pandas-dtype-kernel-64-v2"
 HASH_ENGINE_ID = "pandas.util.hash_array+splitmix64"
+HASH_RUNTIME_ID = "pandas"
 HASH_WIDTH_BITS = 64
 DEFAULT_HASH_SEED = 0
-CANONICALISATION_VERSION = "pandas-dtype-kernels-v2"
+CANONICALISATION_VERSION = "pandas-dtype-kernels-v3"
 NULL_POLICY = "exclude"
 CANONICAL_BYTES_KERNEL_ID = "canonical-bytes-v1"
 _HASH_MASK = (1 << HASH_WIDTH_BITS) - 1
@@ -49,7 +50,13 @@ def _coerce_seed(seed: int) -> int:
 
 @dataclass(frozen=True, slots=True)
 class HashConfiguration:
-    """Versioned hashing metadata required for safe sketch compatibility checks."""
+    """Versioned hashing metadata required for safe sketch compatibility checks.
+
+    An unbound configuration is a user/backend request containing the seed and the
+    library's supported base hash contract. Backend adapters bind it exactly once to
+    a concrete hashing runtime, runtime version and dtype kernel. Bound configurations
+    are immutable compatibility records and cannot be silently rebound.
+    """
 
     seed: int = DEFAULT_HASH_SEED
     algorithm_id: str = HASH_ALGORITHM_ID
@@ -57,6 +64,9 @@ class HashConfiguration:
     width_bits: int = HASH_WIDTH_BITS
     canonicalisation_version: str = CANONICALISATION_VERSION
     null_policy: str = NULL_POLICY
+    runtime_id: str | None = None
+    runtime_version: str | None = None
+    kernel_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "seed", _coerce_seed(self.seed))
@@ -64,12 +74,30 @@ class HashConfiguration:
             value = getattr(self, name)
             if not isinstance(value, str) or not value:
                 raise TypeError(f"{name} must be a non-empty string")
+
+        optional_identifiers = ("runtime_id", "runtime_version", "kernel_id")
+        for name in optional_identifiers:
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise TypeError(f"{name} must be None or a non-empty string")
+
+        recorded = tuple(getattr(self, name) is not None for name in optional_identifiers)
+        if any(recorded) and not all(recorded):
+            raise ValueError(
+                "runtime_id, runtime_version, and kernel_id must be recorded together"
+            )
         if self.width_bits != HASH_WIDTH_BITS:
             raise ValueError(f"Hash width must be {HASH_WIDTH_BITS} bits")
         if self.null_policy != NULL_POLICY:
             raise ValueError(f"Hash null policy must be {NULL_POLICY!r}")
 
-    def as_dict(self) -> dict[str, int | str]:
+    @property
+    def is_bound(self) -> bool:
+        """Whether this configuration records a concrete runtime and kernel."""
+
+        return self.kernel_id is not None
+
+    def as_dict(self) -> dict[str, int | str | None | bool]:
         """Return JSON-safe hashing and canonicalisation metadata."""
 
         return {
@@ -79,33 +107,124 @@ class HashConfiguration:
             "seed": self.seed,
             "canonicalisation_version": self.canonicalisation_version,
             "null_policy": self.null_policy,
+            "runtime_id": self.runtime_id,
+            "runtime_version": self.runtime_version,
+            "kernel_id": self.kernel_id,
+            "is_bound": self.is_bound,
         }
 
 
 DEFAULT_HASH_CONFIGURATION = HashConfiguration()
 
 
-def hash_configuration_for_kernel(
+def bind_hash_configuration(
     configuration: HashConfiguration,
     *,
+    runtime_id: str,
+    runtime_version: str,
+    algorithm_id: str,
+    engine_id: str,
+    canonicalisation_version: str,
     kernel_id: str,
 ) -> HashConfiguration:
-    """Bind generic hash metadata to one dtype kernel for safe sketch merging."""
+    """Bind an unbound hash request to one concrete backend/runtime/kernel contract.
+
+    Binding is idempotent for the exact same contract. Rebinding a recorded runtime,
+    kernel, algorithm, engine, or canonicalisation contract is rejected rather than
+    silently producing a sketch that looks merge-compatible when it is not.
+    """
 
     if not isinstance(configuration, HashConfiguration):
         raise TypeError("configuration must be a HashConfiguration")
+
+    requested = {
+        "runtime_id": runtime_id,
+        "runtime_version": runtime_version,
+        "algorithm_id": algorithm_id,
+        "engine_id": engine_id,
+        "canonicalisation_version": canonicalisation_version,
+        "kernel_id": kernel_id,
+    }
+    for name, value in requested.items():
+        if not isinstance(value, str) or not value:
+            raise TypeError(f"{name} must be a non-empty string")
+
+    if configuration.is_bound:
+        if configuration.runtime_id != runtime_id:
+            raise ValueError(
+                "Hash configuration is already bound to another hashing runtime "
+                f"{configuration.runtime_id!r}"
+            )
+        if configuration.runtime_version != runtime_version:
+            raise ValueError(
+                "Hash configuration is already bound to another recorded hashing "
+                f"runtime version {configuration.runtime_version!r}"
+            )
+        if configuration.kernel_id != kernel_id:
+            raise ValueError(
+                "Hash configuration is already bound to another kernel "
+                f"{configuration.kernel_id!r}"
+            )
+        if configuration.canonicalisation_version != canonicalisation_version:
+            raise ValueError(
+                "Hash configuration uses an unsupported canonicalisation version "
+                f"{configuration.canonicalisation_version!r}"
+            )
+        if (
+            configuration.algorithm_id != algorithm_id
+            or configuration.engine_id != engine_id
+        ):
+            raise ValueError("Hash configuration is bound to another hashing engine")
+        return configuration
+
+    # All public unbound configurations must start from the one supported base
+    # contract. Backends may then bind that request to their concrete native engine.
+    if configuration.canonicalisation_version != CANONICALISATION_VERSION:
+        raise ValueError(
+            "Hash configuration uses an unsupported canonicalisation version "
+            f"{configuration.canonicalisation_version!r}; expected "
+            f"{CANONICALISATION_VERSION!r}"
+        )
     if (
         configuration.algorithm_id != HASH_ALGORITHM_ID
         or configuration.engine_id != HASH_ENGINE_ID
     ):
-        raise ValueError("hash_ndarray only supports the configured pandas ndarray hash engine")
-    if not isinstance(kernel_id, str) or not kernel_id:
-        raise TypeError("kernel_id must be a non-empty string")
+        raise ValueError("Hash configuration does not use the supported base hash contract")
+
     return replace(
         configuration,
-        canonicalisation_version=(
-            f"{configuration.canonicalisation_version};kernel={kernel_id}"
-        ),
+        algorithm_id=algorithm_id,
+        engine_id=engine_id,
+        canonicalisation_version=canonicalisation_version,
+        runtime_id=runtime_id,
+        runtime_version=runtime_version,
+        kernel_id=kernel_id,
+    )
+
+
+def hash_configuration_for_kernel(
+    configuration: HashConfiguration,
+    *,
+    kernel_id: str,
+    runtime_version: str | None = None,
+) -> HashConfiguration:
+    """Bind the supported pandas hash contract to one dtype kernel."""
+
+    if not isinstance(configuration, HashConfiguration):
+        raise TypeError("configuration must be a HashConfiguration")
+    if not isinstance(kernel_id, str) or not kernel_id:
+        raise TypeError("kernel_id must be a non-empty string")
+    if runtime_version is None:
+        pandas_module, _ = _load_array_hash_dependencies()
+        runtime_version = str(pandas_module.__version__)
+    return bind_hash_configuration(
+        configuration,
+        runtime_id=HASH_RUNTIME_ID,
+        runtime_version=runtime_version,
+        algorithm_id=HASH_ALGORITHM_ID,
+        engine_id=HASH_ENGINE_ID,
+        canonicalisation_version=CANONICALISATION_VERSION,
+        kernel_id=kernel_id,
     )
 
 
@@ -141,12 +260,7 @@ def canonicalize_scalar(value: object) -> bytes:
         return b"y" + bytes(value)
 
     if isinstance(value, Decimal):
-        if value.is_nan():
-            raise ValueError("Decimal NaN values must be excluded before cardinality hashing")
-        if value.is_zero():
-            value = Decimal(0)
-        normalised = value.normalize()
-        return b"d" + str(normalised).encode("ascii")
+        return _canonicalize_decimal(value)
 
     if isinstance(value, datetime):
         if value.tzinfo is not None and value.utcoffset() is not None:
@@ -185,6 +299,37 @@ def canonicalize_scalar(value: object) -> bytes:
     )
 
 
+def _canonicalize_decimal(value: Decimal) -> bytes:
+    """Canonicalise a Decimal without context-dependent decimal arithmetic.
+
+    ``Decimal.normalize()`` is intentionally avoided because its result can depend on
+    the active decimal context. The coefficient is canonicalised directly from
+    ``as_tuple()`` by removing trailing decimal zeros and compensating the integer
+    exponent. Numerically equal finite values therefore have identical bytes.
+    """
+
+    if value.is_nan():
+        raise ValueError("Decimal NaN values must be excluded before cardinality hashing")
+
+    decimal_tuple = value.as_tuple()
+    sign = int(decimal_tuple.sign)
+    if value.is_infinite():
+        return f"d{sign}:inf".encode("ascii")
+
+    digits = list(decimal_tuple.digits)
+    exponent = int(decimal_tuple.exponent)
+
+    if not any(digits):
+        return b"d0:0:0"
+
+    while digits and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+
+    coefficient = "".join(str(digit) for digit in digits)
+    return f"d{sign}:{coefficient}:{exponent}".encode("ascii")
+
+
 def hash_ndarray(
     values: object,
     *,
@@ -198,16 +343,10 @@ def hash_ndarray(
     ensuring numeric dtypes are seeded even when pandas ignores ``hash_key`` for them.
     """
 
-    if not isinstance(configuration, HashConfiguration):
-        raise TypeError("configuration must be a HashConfiguration")
-    if (
-        configuration.algorithm_id != HASH_ALGORITHM_ID
-        or configuration.engine_id != HASH_ENGINE_ID
-    ):
-        raise ValueError("hash_ndarray only supports the configured pandas ndarray hash engine")
-    if not isinstance(kernel_id, str) or not kernel_id:
-        raise TypeError("kernel_id must be a non-empty string")
-
+    effective_configuration = hash_configuration_for_kernel(
+        configuration,
+        kernel_id=kernel_id,
+    )
     pandas_module, numpy_module = _load_array_hash_dependencies()
     array = numpy_module.asarray(values)
     if array.ndim != 1:
@@ -215,7 +354,7 @@ def hash_ndarray(
     if array.size == 0:
         return numpy_module.empty(0, dtype=numpy_module.uint64)
 
-    hash_key = f"{configuration.seed:016x}"
+    hash_key = f"{effective_configuration.seed:016x}"
     base_hashes = pandas_module.util.hash_array(
         array,
         encoding="utf8",
@@ -223,7 +362,7 @@ def hash_ndarray(
         categorize=False,
     )
     hashes = numpy_module.asarray(base_hashes, dtype=numpy_module.uint64).copy()
-    hashes ^= numpy_module.uint64(configuration.seed)
+    hashes ^= numpy_module.uint64(effective_configuration.seed)
     hashes ^= numpy_module.uint64(_kernel_salt(kernel_id))
     return _splitmix64_array(hashes, numpy_module=numpy_module)
 

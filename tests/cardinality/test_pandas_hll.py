@@ -7,8 +7,9 @@ import pandas as pd
 import pytest
 
 from data_quality.cardinality import HashConfiguration, hash_scalar
-from data_quality.cardinality.pandas import (
+from data_quality.cardinality.pandas_backend import (
     DEFAULT_PANDAS_CHUNK_SIZE,
+    iter_pandas_hash_arrays,
     iter_pandas_hashes,
     pandas_hll_nunique,
     pandas_hll_sketch,
@@ -107,6 +108,50 @@ def test_common_pandas_dtypes_match_exact_non_null_count(
     assert dataframe["value"].nunique(dropna=True) == expected
     assert len(set(iter_pandas_hashes(dataframe, "value"))) == expected
     assert pandas_hll_nunique(dataframe, "value") == expected
+
+
+def test_categorical_hashes_are_independent_of_category_order_and_ordered_flag() -> None:
+    left = _frame(
+        pd.Series(
+            pd.Categorical(
+                ["a", "b", "a"],
+                categories=["a", "b"],
+                ordered=False,
+            )
+        )
+    )
+    right = _frame(
+        pd.Series(
+            pd.Categorical(
+                ["a", "b", "a"],
+                categories=["b", "a"],
+                ordered=True,
+            )
+        )
+    )
+
+    left_hashes = np.concatenate(list(iter_pandas_hash_arrays(left, "value", chunk_size=2)))
+    right_hashes = np.concatenate(
+        list(iter_pandas_hash_arrays(right, "value", chunk_size=2))
+    )
+
+    assert np.array_equal(left_hashes, right_hashes)
+
+
+def test_categorical_sketches_with_different_dictionaries_can_merge() -> None:
+    left = _frame(
+        pd.Series(pd.Categorical(["a", "b"], categories=["a", "b"]))
+    )
+    right = _frame(
+        pd.Series(pd.Categorical(["b", "c"], categories=["b", "c"]))
+    )
+
+    left_sketch = pandas_hll_sketch(left, "value")
+    right_sketch = pandas_hll_sketch(right, "value")
+
+    left_sketch.merge(right_sketch)
+
+    assert round(left_sketch.estimate()) == 3
 
 
 def test_period_dtype_is_supported() -> None:
@@ -219,7 +264,7 @@ def test_numpy_datetime_and_timedelta_scalars_are_supported_in_object_dtype() ->
 def test_missing_optional_pandas_dependency_has_actionable_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import data_quality.cardinality.pandas as pandas_hll_module
+    import data_quality.cardinality.pandas_backend as pandas_hll_module
 
     original_import_module = pandas_hll_module.import_module
 

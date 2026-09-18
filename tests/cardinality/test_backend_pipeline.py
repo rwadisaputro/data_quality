@@ -60,7 +60,7 @@ def test_dataframe_json_contains_full_backend_and_dtype_lineage() -> None:
 
     payload = json.loads(profile_cardinality_json(dataframe, "flag", batch_size=2))
 
-    assert payload["schema_version"] == "adaptive-cardinality-v5"
+    assert payload["schema_version"] == "adaptive-cardinality-v6"
     assert payload["lineage"]["backend"]["name"] == "pandas"
     assert payload["lineage"]["backend"]["dataframe_api"] == "pandas"
     assert payload["lineage"]["backend"]["frame_kind"] == "dataframe"

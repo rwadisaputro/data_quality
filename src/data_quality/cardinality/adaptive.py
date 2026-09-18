@@ -23,8 +23,8 @@ DEFAULT_EXACT_UNIQUE_THRESHOLD = 50_000
 DEFAULT_EXACT_MEMORY_BUDGET_BYTES = 32 * 1024 * 1024
 DEFAULT_MEMORY_SAFETY_FACTOR = 1.25
 DEFAULT_THRESHOLD_CHECK_INTERVAL = 4_096
-RESULT_SCHEMA_VERSION = "adaptive-cardinality-v5"
-ALGORITHM_VERSION = "exact-to-classic-hll-v1"
+RESULT_SCHEMA_VERSION = "adaptive-cardinality-v6"
+ALGORITHM_VERSION = "exact-to-classic-hll-v2"
 
 
 class CardinalityMode(str, Enum):
@@ -204,6 +204,7 @@ class AdaptiveCardinalityHandler:
     __slots__ = (
         "_array_hasher",
         "_config",
+        "_exact_state_raw_bytes",
         "_exact_values",
         "_hll",
         "_mode",
@@ -222,6 +223,7 @@ class AdaptiveCardinalityHandler:
         self._config = config or AdaptiveCardinalityConfig()
         self._array_hasher = array_hasher
         self._load_numpy()
+        self._exact_state_raw_bytes = 0
         self._exact_values: Any | None = None
         self._hll: HashedHyperLogLog | None = None
         self._mode = CardinalityMode.EXACT
@@ -260,7 +262,7 @@ class AdaptiveCardinalityHandler:
 
     @property
     def retained_exact_state_bytes(self) -> int:
-        return self._measure_exact_state_bytes(self._exact_values)
+        return self._apply_memory_safety_factor(self._exact_state_raw_bytes)
 
     @property
     def hll(self) -> HashedHyperLogLog | None:
@@ -308,22 +310,66 @@ class AdaptiveCardinalityHandler:
                 if self._exact_values is None
                 else self._exact_values
             )
-            unique_batch = numpy_module.unique(batch)
-            merged = numpy_module.union1d(base_exact_values, unique_batch)
-            exact_state_bytes = self._measure_exact_state_bytes(merged)
-            reason = self._promotion_reason(len(merged), exact_state_bytes)
+            unseen_mask = self._values_not_in_sorted_state_mask(
+                base_exact_values,
+                batch,
+            )
 
-            if reason is None:
-                self._exact_values = merged
-                self._update_peaks(len(merged), exact_state_bytes)
+            # Repetitive chunks are the common low-cardinality case. If the
+            # chunk contributes no new exact values, neither threshold can
+            # change, so avoid sorting/uniquing, allocations, and memory scans.
+            if not bool(unseen_mask.any()):
                 continue
 
-            prefix_length, crossing_state, crossing_bytes, crossing_reason = (
-                self._find_first_promotion_prefix(base_exact_values, batch)
+            unseen_indexes = numpy_module.flatnonzero(unseen_mask)
+            unseen_batch = batch[unseen_mask]
+            new_values, first_unseen_indexes = numpy_module.unique(
+                unseen_batch,
+                return_index=True,
+            )
+            first_batch_indexes = unseen_indexes[first_unseen_indexes]
+            new_value_raw_bytes = self._measure_exact_value_raw_bytes(new_values)
+
+            projected_unique_count = len(base_exact_values) + len(new_values)
+            projected_raw_bytes = (
+                self._exact_state_raw_bytes
+                + int(new_value_raw_bytes.sum())
+            )
+            exact_state_bytes = self._apply_memory_safety_factor(projected_raw_bytes)
+            reason = self._promotion_reason(
+                projected_unique_count,
+                exact_state_bytes,
+            )
+
+            if reason is None:
+                self._exact_values = self._merge_sorted_unique(
+                    base_exact_values,
+                    new_values,
+                )
+                self._exact_state_raw_bytes = projected_raw_bytes
+                self._update_peaks(projected_unique_count, exact_state_bytes)
+                continue
+
+            (
+                crossing_batch_index,
+                crossing_new_values,
+                crossing_raw_bytes,
+                crossing_bytes,
+                crossing_reason,
+            ) = self._find_promotion_crossing_from_new_values(
+                base_exact_values,
+                new_values,
+                first_batch_indexes,
+                new_value_raw_bytes,
+            )
+            crossing_state = self._merge_sorted_unique(
+                base_exact_values,
+                crossing_new_values,
             )
             self._exact_values = crossing_state
+            self._exact_state_raw_bytes = crossing_raw_bytes
             self._update_peaks(len(crossing_state), crossing_bytes)
-            crossing_index = start + prefix_length
+            crossing_index = start + crossing_batch_index
             row_position = int(positions[crossing_index - 1])
             non_null_position = non_null_before + crossing_index
             self._promote(
@@ -402,6 +448,7 @@ class AdaptiveCardinalityHandler:
         unique_count = len(self._exact_values)
 
         self._exact_values = None
+        self._exact_state_raw_bytes = 0
         self._hll = hll
         self._mode = CardinalityMode.HLL
         self._promotion = PromotionMetadata(
@@ -426,35 +473,74 @@ class AdaptiveCardinalityHandler:
             )
         return self._array_hasher(canonical_values)
 
-    def _find_first_promotion_prefix(
+    def _find_promotion_crossing_from_new_values(
         self,
         base_exact_values: object,
-        batch: object,
-    ) -> tuple[int, Any, int, PromotionReason]:
-        """Find the first row in a triggering batch that actually crosses a limit."""
+        new_values: object,
+        first_batch_indexes: object,
+        new_value_raw_bytes: object,
+    ) -> tuple[int, Any, int, int, PromotionReason]:
+        """Locate the first threshold crossing without rescanning batch prefixes.
+
+        ``new_values`` contains each genuinely new value exactly once in sorted
+        value order. ``first_batch_indexes`` records where each one first appeared
+        in the current batch. Sorting only those first-occurrence indexes lets us
+        calculate cumulative unique-count and memory growth in one pass.
+        """
 
         numpy_module = self._load_numpy()
         base = numpy_module.asarray(base_exact_values)
-        values = numpy_module.asarray(batch)
-        low = 1
-        high = len(values)
+        additions = numpy_module.asarray(new_values)
+        first_indexes = numpy_module.asarray(first_batch_indexes, dtype=numpy_module.int64)
+        raw_bytes = numpy_module.asarray(new_value_raw_bytes, dtype=numpy_module.int64)
 
-        while low < high:
-            middle = (low + high) // 2
-            candidate = numpy_module.union1d(base, numpy_module.unique(values[:middle]))
-            candidate_bytes = self._measure_exact_state_bytes(candidate)
-            reason = self._promotion_reason(len(candidate), candidate_bytes)
-            if reason is None:
-                low = middle + 1
-            else:
-                high = middle
+        occurrence_order = numpy_module.argsort(first_indexes, kind="stable")
+        ordered_first_indexes = first_indexes[occurrence_order]
+        ordered_raw_bytes = raw_bytes[occurrence_order]
+        cumulative_raw_bytes = (
+            self._exact_state_raw_bytes
+            + numpy_module.cumsum(ordered_raw_bytes, dtype=numpy_module.int64)
+        )
+        cumulative_unique_counts = len(base) + numpy_module.arange(
+            1,
+            len(additions) + 1,
+            dtype=numpy_module.int64,
+        )
+        safe_bytes = numpy_module.ceil(
+            cumulative_raw_bytes.astype(numpy_module.float64)
+            * self.config.memory_safety_factor
+        ).astype(numpy_module.int64)
+        crossing_mask = (
+            cumulative_unique_counts > self.config.exact_unique_threshold
+        ) | (safe_bytes > self.config.exact_memory_budget_bytes)
+        crossing_candidates = numpy_module.flatnonzero(crossing_mask)
+        if crossing_candidates.size == 0:  # pragma: no cover - triggering batch invariant
+            raise RuntimeError("promotion analysis did not find a crossing value")
 
-        crossing_state = numpy_module.union1d(base, numpy_module.unique(values[:low]))
-        crossing_bytes = self._measure_exact_state_bytes(crossing_state)
-        crossing_reason = self._promotion_reason(len(crossing_state), crossing_bytes)
-        if crossing_reason is None:  # pragma: no cover - triggering batch invariant
-            raise RuntimeError("promotion refinement did not find a crossing prefix")
-        return low, crossing_state, crossing_bytes, crossing_reason
+        crossing_order_index = int(crossing_candidates[0])
+        included_count = crossing_order_index + 1
+        included_value_indexes = occurrence_order[:included_count]
+        included_mask = numpy_module.zeros(len(additions), dtype=bool)
+        included_mask[included_value_indexes] = True
+        crossing_new_values = additions[included_mask]
+        crossing_raw_bytes = int(cumulative_raw_bytes[crossing_order_index])
+        crossing_bytes = int(safe_bytes[crossing_order_index])
+        crossing_unique_count = int(cumulative_unique_counts[crossing_order_index])
+        crossing_reason = self._promotion_reason(
+            crossing_unique_count,
+            crossing_bytes,
+        )
+        if crossing_reason is None:  # pragma: no cover - crossing-mask invariant
+            raise RuntimeError("promotion analysis produced no promotion reason")
+
+        crossing_batch_index = int(ordered_first_indexes[crossing_order_index]) + 1
+        return (
+            crossing_batch_index,
+            crossing_new_values,
+            crossing_raw_bytes,
+            crossing_bytes,
+            crossing_reason,
+        )
 
     def _promotion_reason(
         self,
@@ -472,6 +558,10 @@ class AdaptiveCardinalityHandler:
         return None
 
     def _measure_exact_state_bytes(self, values: object | None) -> int:
+        raw_bytes = self._measure_exact_state_raw_bytes(values)
+        return self._apply_memory_safety_factor(raw_bytes)
+
+    def _measure_exact_state_raw_bytes(self, values: object | None) -> int:
         if values is None:
             return 0
         numpy_module = self._load_numpy()
@@ -482,7 +572,78 @@ class AdaptiveCardinalityHandler:
         if array.dtype.hasobject:
             object_sizes = numpy_module.frompyfunc(sys.getsizeof, 1, 1)(array)
             raw_bytes += int(object_sizes.astype(numpy_module.int64).sum())
+        return raw_bytes
+
+    def _measure_exact_value_raw_bytes(self, values: object) -> Any:
+        """Return each retained value's incremental raw exact-state byte cost."""
+
+        numpy_module = self._load_numpy()
+        array = numpy_module.asarray(values)
+        if array.size == 0:
+            return numpy_module.empty(0, dtype=numpy_module.int64)
+
+        per_value_storage = array.dtype.itemsize
+        costs = numpy_module.full(
+            array.size,
+            per_value_storage,
+            dtype=numpy_module.int64,
+        )
+        if array.dtype.hasobject:
+            object_sizes = numpy_module.frompyfunc(sys.getsizeof, 1, 1)(array)
+            costs += object_sizes.astype(numpy_module.int64)
+        return costs
+
+    def _apply_memory_safety_factor(self, raw_bytes: int) -> int:
+        if raw_bytes <= 0:
+            return 0
         return math.ceil(raw_bytes * self.config.memory_safety_factor)
+
+    @staticmethod
+    def _values_not_in_sorted_state_mask(
+        base_values: object,
+        candidate_values: object,
+    ) -> Any:
+        """Return a Boolean mask for candidates absent from sorted exact state."""
+
+        numpy_module = AdaptiveCardinalityHandler._load_numpy()
+        base = numpy_module.asarray(base_values)
+        candidates = numpy_module.asarray(candidate_values)
+        if candidates.size == 0:
+            return numpy_module.zeros(0, dtype=bool)
+        if base.size == 0:
+            return numpy_module.ones(candidates.size, dtype=bool)
+
+        positions = numpy_module.searchsorted(base, candidates)
+        in_bounds = positions < base.size
+        already_present = numpy_module.zeros(candidates.size, dtype=bool)
+        already_present[in_bounds] = (
+            base[positions[in_bounds]] == candidates[in_bounds]
+        )
+        return ~already_present
+
+    @staticmethod
+    def _merge_sorted_unique(
+        base_values: object,
+        new_values: object,
+    ) -> Any:
+        """Merge two sorted unique arrays when ``new_values`` is disjoint from base."""
+
+        numpy_module = AdaptiveCardinalityHandler._load_numpy()
+        base = numpy_module.asarray(base_values)
+        additions = numpy_module.asarray(new_values)
+        if base.size == 0:
+            return additions.copy()
+        if additions.size == 0:
+            return base.copy()
+
+        insertion_points = numpy_module.searchsorted(base, additions)
+        output_indexes = insertion_points + numpy_module.arange(additions.size)
+        merged = numpy_module.empty(base.size + additions.size, dtype=base.dtype)
+        is_addition = numpy_module.zeros(merged.size, dtype=bool)
+        is_addition[output_indexes] = True
+        merged[is_addition] = additions
+        merged[~is_addition] = base
+        return merged
 
     def _update_peaks(self, unique_count: int, exact_state_bytes: int) -> None:
         self._peak_exact_unique_count = max(self._peak_exact_unique_count, unique_count)

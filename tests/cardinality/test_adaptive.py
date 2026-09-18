@@ -70,6 +70,81 @@ def test_duplicate_heavy_input_does_not_promote_on_row_count() -> None:
     assert not result.promotion.occurred
 
 
+def test_duplicate_only_batch_skips_exact_state_merge_and_memory_remeasure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from data_quality.cardinality import AdaptiveCardinalityHandler
+
+    handler = AdaptiveCardinalityHandler(
+        AdaptiveCardinalityConfig(
+            exact_unique_threshold=100,
+            exact_memory_budget_bytes=10_000_000,
+            threshold_check_interval=32,
+        ),
+        array_hasher=lambda values: np.asarray(values, dtype=np.uint64),
+    )
+    handler.add_canonical_array(np.array([1, 2, 3], dtype=np.int64))
+
+    def fail_merge(*args: object, **kwargs: object) -> object:
+        raise AssertionError("duplicate-only batches must not rebuild exact state")
+
+    def fail_measure(*args: object, **kwargs: object) -> int:
+        raise AssertionError("duplicate-only batches must not remeasure exact memory")
+
+    def fail_unique(*args: object, **kwargs: object) -> object:
+        raise AssertionError("duplicate-only batches must not sort/unique the chunk")
+
+    monkeypatch.setattr(
+        AdaptiveCardinalityHandler,
+        "_merge_sorted_unique",
+        staticmethod(fail_merge),
+    )
+    monkeypatch.setattr(
+        AdaptiveCardinalityHandler,
+        "_measure_exact_state_raw_bytes",
+        fail_measure,
+    )
+    monkeypatch.setattr(np, "unique", fail_unique)
+
+    handler.add_canonical_array(
+        np.array([3, 2, 1, 1, 2, 3] * 10, dtype=np.int64)
+    )
+
+    assert handler.mode is CardinalityMode.EXACT
+    assert handler.distinct_count() == 3
+
+
+def test_triggering_batch_uniques_once_and_does_not_rescan_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from data_quality.cardinality import AdaptiveCardinalityHandler
+
+    handler = AdaptiveCardinalityHandler(
+        AdaptiveCardinalityConfig(
+            exact_unique_threshold=5,
+            exact_memory_budget_bytes=10_000_000,
+            threshold_check_interval=64,
+        ),
+        array_hasher=lambda values: np.asarray(values, dtype=np.uint64),
+    )
+
+    real_unique = np.unique
+    unique_calls = 0
+
+    def counting_unique(*args: object, **kwargs: object) -> object:
+        nonlocal unique_calls
+        unique_calls += 1
+        return real_unique(*args, **kwargs)
+
+    monkeypatch.setattr(np, "unique", counting_unique)
+    handler.add_canonical_array(np.array([0, 1, 2, 3, 4, 5, 6], dtype=np.int64))
+
+    assert handler.mode is CardinalityMode.HLL
+    assert handler.promotion.row_position == 5
+    assert handler.promotion.unique_count == 6
+    assert unique_calls == 1
+
+
 def test_memory_threshold_can_promote_before_unique_threshold() -> None:
     dataframe = _frame(pd.Series(["x" * 100 + str(i) for i in range(20)], dtype="string"))
     config = AdaptiveCardinalityConfig(
@@ -123,7 +198,7 @@ def test_json_contains_dataframe_output_parameters_and_lineage() -> None:
             chunk_size=3,
         )
     )
-    assert payload["schema_version"] == "adaptive-cardinality-v5"
+    assert payload["schema_version"] == "adaptive-cardinality-v6"
     assert payload["output"]["distinct_count"] == 2
     assert payload["output"]["is_exact"] is True
     assert payload["row_metrics"] == {
@@ -296,3 +371,21 @@ def test_empty_dataframe_column_has_complete_exact_json_output() -> None:
         "non_null_count": 0,
         "null_count": 0,
     }
+
+
+def test_exact_memory_helpers_cover_object_and_empty_incremental_arrays() -> None:
+    from data_quality.cardinality import AdaptiveCardinalityHandler
+
+    handler = AdaptiveCardinalityHandler()
+    object_values = np.array([b"a", b"bb"], dtype=object)
+
+    assert handler._measure_exact_state_raw_bytes(object_values) > object_values.nbytes
+    assert handler._measure_exact_state_raw_bytes(np.array([1, 2], dtype=np.int64)) == 16
+    incremental = handler._measure_exact_value_raw_bytes(object_values)
+    assert incremental.shape == (2,)
+    assert int(incremental.sum()) == handler._measure_exact_state_raw_bytes(object_values)
+    assert handler._measure_exact_value_raw_bytes(np.array([], dtype=np.int64)).size == 0
+    assert handler._values_not_in_sorted_state_mask(
+        np.array([1], dtype=np.int64),
+        np.array([], dtype=np.int64),
+    ).size == 0

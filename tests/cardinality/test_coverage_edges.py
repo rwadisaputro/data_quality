@@ -9,7 +9,7 @@ import pytest
 import data_quality.cardinality.adaptive as adaptive_module
 import data_quality.cardinality.hashing as hashing_module
 import data_quality.cardinality.hll as hll_module
-import data_quality.cardinality.pandas as pandas_module_impl
+import data_quality.cardinality.pandas_backend as pandas_module_impl
 from data_quality import (
     AdaptiveCardinalityConfig,
     CardinalityProfilingError,

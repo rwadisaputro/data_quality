@@ -247,3 +247,224 @@ lazy Polars behavior, Spark metadata-only and exact modes, streaming Spark
 frames, immutable registry failures, JSON-safe reporting, and the original
 backend-identification guarantees. Real Polars and PySpark type-routing checks
 activate automatically when those optional packages are installed.
+
+## Adaptive cardinality profiling
+
+Cardinality profiling now follows the same backend-neutral dispatch pattern as schema
+discovery. The public dataframe entry point first calls `identify_backend(dataframe)`,
+wraps the original native frame with that backend identity, and dispatches to a registered
+cardinality adapter. The exact-to-HLL state machine itself does not inspect pandas, Polars,
+or Spark objects.
+
+For pandas, the adapter reads each selected column's native dtype from `DataFrame.dtypes`
+before processing values. Callers may either provide a column label for a single-column
+result or omit the column entirely to profile every dataframe column. The dtype is
+classified into a stable family such as `integer`, `boolean`, `floating`, `string`,
+`categorical`, or `datetime`, and that metadata is carried into JSON lineage.
+
+```python
+import pandas as pd
+
+from data_quality import AdaptiveCardinalityConfig, profile_cardinality_json
+
+sample_dataframe = pd.DataFrame(
+    {
+        "customer_id": pd.Series([101, 102, 102, 103, None], dtype="Int64"),
+    }
+)
+
+config = AdaptiveCardinalityConfig(
+    exact_unique_threshold=50_000,
+    exact_memory_budget_bytes=32 * 1024 * 1024,
+    memory_safety_factor=1.25,
+    hll_precision=14,
+    threshold_check_interval=4_096,
+)
+
+# One column
+print(
+    profile_cardinality_json(
+        sample_dataframe,
+        "customer_id",
+        config=config,
+        batch_size=65_536,
+    )
+)
+
+# Every column: backend detection still happens only at the dataframe boundary.
+print(profile_cardinality_json(sample_dataframe, config=config))
+```
+
+The pipeline is:
+
+```text
+native dataframe
+    -> identify_backend(dataframe)
+    -> backend-neutral CardinalityRegistry
+    -> backend adapter
+    -> native column metadata / dtype classification
+    -> canonical ndarray batches
+    -> exact AdaptiveCardinalityHandler
+    -> threshold exceeded?
+         no  -> exact result
+         yes -> hash ndarray -> HyperLogLog
+    -> JSON result + lineage
+```
+
+The default cardinality registry now includes pandas, Polars, and PySpark adapters. Each
+backend owns native dtype discovery and native batch/hash execution while sharing the same
+public `profile_cardinality(...)` API, result models, and classic HLL implementation.
+
+
+### Polars cardinality adapter
+
+Eager `polars.DataFrame` and lazy `polars.LazyFrame` inputs use the same backend-neutral
+entry point:
+
+```python
+from data_quality import profile_cardinality
+
+result = profile_cardinality(polars_dataframe, "customer_id")
+report = profile_cardinality(polars_dataframe)
+```
+
+The adapter reads the native Polars schema without sampling values. Eager frames stream
+through `DataFrame.iter_slices`; lazy frames use streaming `collect_batches` when available
+and fall back to a streaming `collect` sliced into bounded batches. Native dtype families
+select vectorised NumPy exact-state representations, while `polars.Series.hash` produces
+64-bit hashes in bulk. The Polars version is bound into the hash configuration because
+Polars documents hash stability within a version rather than as a cross-version contract.
+
+Supported scalar dtype families include boolean, integer, floating, string, binary, decimal,
+date, datetime, duration, time, categorical, enum, null, and object fallback. Nested and
+unknown dtypes are returned as structured unsupported-column outcomes during whole-frame
+profiling. Object columns use the shared scalar canonicaliser and emit the same structured
+performance/unsupported-scalar diagnostics as the pandas fallback.
+
+### PySpark cardinality adapter
+
+Spark SQL DataFrames also use the same public entry point:
+
+```python
+from data_quality import AdaptiveCardinalityConfig, profile_cardinality
+
+config = AdaptiveCardinalityConfig(exact_unique_threshold=50_000, hll_precision=14)
+result = profile_cardinality(spark_dataframe, "customer_id", config=config)
+report = profile_cardinality(spark_dataframe, config=config)
+```
+
+PySpark uses a distributed two-stage adaptive strategy rather than streaming source rows
+through Python. Stage one performs bounded distributed exact discovery with
+`distinct().limit(threshold + 1)` and computes row/null metrics in Spark SQL. If the exact
+unique and memory thresholds are still safe, the result remains exact. If either threshold
+is exceeded, stage two computes the project's classic HLL registers in Spark SQL using
+`xxhash64`, register-index/rho expressions, and `groupBy(register).max(rho)`. Only the
+compact per-register maxima (at most `2**p` rows) are collected to Python and merged into
+the shared `HyperLogLog` sketch. Spark's built-in approximate distinct-count implementation
+is not used, so estimator semantics remain the same classic HLL + Linear Counting used by
+the other adapters.
+
+Supported Spark SQL scalar families include boolean, integer, floating, decimal, string,
+binary, date, timestamp, timestamp-without-time-zone, day-time interval, year-month interval,
+and null. Array, map, struct, and unknown dtypes are reported as structured unsupported
+column outcomes. Floating NaN values follow the library null-like exclusion policy, and
+`-0.0` is normalised with `0.0` before hashing.
+
+Because Spark stage one is a distributed distinct operation, exact-to-HLL promotion cannot
+report a meaningful original source-row position; the result records the promotion reason,
+exact candidate count/state size, and explicitly identifies the execution strategy as
+`two_stage_exact_then_hll` in lineage. Whole-DataFrame PySpark profiling currently runs the
+per-column distributed plan independently; a future optimisation can combine compatible
+column jobs without changing the public interface or HLL core.
+
+### Exact-to-HLL promotion
+
+The adaptive state starts with exact canonical uniques and promotes one-way to classic
+64-bit HyperLogLog only after a configured exact-state threshold is exceeded. The default
+limits are 50,000 exact unique values or 32 MiB of retained exact-state memory.
+
+If the exact state never exceeds either threshold, the JSON reports an exact result. After
+promotion, the retained exact uniques are hashed into HLL once, the exact state is released,
+and all later values update only the HLL sketch. Promotion is permanent.
+
+The JSON report exposes `output.distinct_count` as an integer for both exact and HLL modes.
+When HLL is used, the unrounded floating estimator remains available as
+`hll_state.raw_estimate` for audit/debug purposes. The report also includes the
+exact/approximate method, row/null metrics, all adaptive thresholds, HLL
+precision/register/RSE metadata, complete hash configuration,
+peak exact-state usage, promotion reason and row position, the full `BackendIdentity` from
+`identify_backend`, pandas dtype metadata and dtype family, NumPy version, and execution
+parameters.
+
+### pandas dtype-specialised ndarray hashing path
+
+Pandas dtype metadata is inspected before value processing. Homogeneous native dtypes use
+backend-specific ndarray kernels rather than scalar canonicalisation:
+
+- boolean -> NumPy boolean array;
+- integer -> native signed/unsigned integer array;
+- floating -> normalised `float64` array;
+- complex -> normalised `complex128` array;
+- pandas string -> object string ndarray without scalar conversion;
+- categorical -> exact category-code array with a category-signature kernel id;
+- datetime / datetime-with-timezone -> nanosecond `int64` values, with timezone-aware
+  values represented as UTC instants;
+- timedelta -> nanosecond `int64` values;
+- period -> ordinal `int64` values plus frequency in the kernel id;
+- interval -> native interval object ndarray hashed in bulk.
+
+Only `object` and otherwise-unclassified pandas dtypes use the type-aware scalar
+canonicaliser. That fallback is explicit in result lineage and emits a structured
+`scalar_canonicalization_fallback` performance warning. If the fallback encounters an
+unsupported logical scalar, a single-column call raises `UnsupportedCardinalityValueError`
+with machine-readable context. A dataframe-wide call isolates that column, records an
+`unsupported_cardinality_scalar` error for it, and continues profiling other columns.
+
+Every hashing kernel produces `np.uint64` arrays through `pandas.util.hash_array` followed
+by a vectorised SplitMix64 finaliser. The finaliser incorporates the configured 64-bit seed
+and a stable dtype-kernel salt, including for numeric pandas hashes where `hash_key` alone
+does not affect the native hash. HLL register updates consume those arrays in bulk via the
+NumPy update path.
+
+The hash contract is versioned as `pandas-dtype-kernel-64-v2`. The selected kernel id is
+bound into `HashConfiguration.canonicalisation_version`, so sketches produced under
+incompatible dtype semantics are rejected during merge. The adaptive/HLL core remains
+backend-neutral: pandas supplies canonical exact-state ndarrays plus an ndarray hasher.
+
+Null-like values detected by `Series.isna()` are excluded from cardinality. Floating-point
+`-0.0` and `0.0` are normalised together. Mixed `object` columns retain the scalar
+canonicaliser's type-aware distinction between integer `1`, boolean `True`, float `1.0`,
+and string `"1"`.
+
+The lower-level pandas HLL-only APIs are also DataFrame-first. Callers pass the native
+DataFrame plus a column label; Series objects are only created internally after backend and
+dtype metadata have been resolved:
+
+```python
+from data_quality.cardinality import pandas_hll_nunique, pandas_hll_sketch
+
+estimate = pandas_hll_nunique(sample_dataframe, "customer_id", precision=14)
+sketch = pandas_hll_sketch(sample_dataframe, "customer_id", precision=14)
+```
+
+Configured sketches carry their hash seed, engine, and canonicalisation metadata. A merge
+is rejected when those configurations differ, preventing sketches built under incompatible
+equality/hash semantics from being silently combined.
+
+### Cardinality test coverage
+
+The cardinality implementation is expected to maintain at least 99% statement and branch
+coverage. Run the focused cardinality suite from the repository root with:
+
+```bash
+python -m pytest tests/cardinality -v \
+  --cov=data_quality.cardinality \
+  --cov-branch \
+  --cov-report=term-missing \
+  --cov-fail-under=99
+```
+
+The current cardinality suite reaches 100% statement and branch coverage. This focused
+threshold deliberately measures `data_quality.cardinality`; other pre-existing backend and
+schema-discovery modules have their own test coverage and are not hidden from whole-project
+coverage reports.

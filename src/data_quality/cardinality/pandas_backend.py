@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import operator
 from collections.abc import Iterator
@@ -65,6 +64,7 @@ class PandasDtypeIdentity:
     numpy_kind: str | None
     is_extension_dtype: bool
     canonicalisation_strategy: str
+    integer_signedness: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -72,6 +72,7 @@ class PandasDtypeIdentity:
             "numpy_kind": self.numpy_kind,
             "is_extension_dtype": self.is_extension_dtype,
             "canonicalisation_strategy": self.canonicalisation_strategy,
+            "integer_signedness": self.integer_signedness,
         }
 
 
@@ -90,6 +91,15 @@ class PandasHashKernel:
             "scalar_fallback": self.scalar_fallback,
             "hash_execution": "numpy_ndarray_bulk",
         }
+
+
+@dataclass(slots=True)
+class _CategoricalTokenLookup:
+    """Lazily canonicalised category dictionary shared across dataframe chunks."""
+
+    categories: Any
+    tokens: Any
+    resolved: Any
 
 
 def identify_pandas_dtype(dtype: object) -> PandasDtypeIdentity:
@@ -140,11 +150,16 @@ def identify_pandas_dtype(dtype: object) -> PandasDtypeIdentity:
         strategy = f"pandas_dtype_kernel_{family.value}"
 
     numpy_kind = getattr(dtype, "kind", None)
+    kind_text = None if numpy_kind is None else str(numpy_kind)
+    integer_signedness = None
+    if family is PandasDtypeFamily.INTEGER:
+        integer_signedness = "unsigned" if kind_text == "u" else "signed"
     return PandasDtypeIdentity(
         family=family,
-        numpy_kind=None if numpy_kind is None else str(numpy_kind),
+        numpy_kind=kind_text,
         is_extension_dtype=isinstance(dtype, extension_type),
         canonicalisation_strategy=strategy,
+        integer_signedness=integer_signedness,
     )
 
 
@@ -162,7 +177,7 @@ def iter_pandas_hash_arrays(
     dtype_identity = resolution[5]
     native_dtype = resolution[7]
     kernel = _pandas_hash_kernel(native_dtype, dtype_identity)
-    for tokens, _ in _iter_pandas_canonical_arrays(
+    for tokens, _, _ in _iter_pandas_canonical_arrays(
         pandas_series,
         chunk_size=chunk_size,
         dtype_identity=dtype_identity,
@@ -213,7 +228,7 @@ def pandas_hll_sketch(
         precision=precision,
         hash_configuration=effective_configuration,
     )
-    for tokens, _ in _iter_pandas_canonical_arrays(
+    for tokens, _, _ in _iter_pandas_canonical_arrays(
         pandas_series,
         chunk_size=chunk_size,
         dtype_identity=dtype_identity,
@@ -392,18 +407,20 @@ def _pandas_adaptive_cardinality_resolved(
 
     handler = AdaptiveCardinalityHandler(effective_config, array_hasher=array_hasher)
     chunk_count = 0
+    null_count = 0
     column_label = pandas_dataframe.columns[_position]
-    for tokens, row_positions in _iter_pandas_canonical_arrays(
+    for tokens, row_positions, chunk_null_count in _iter_pandas_canonical_arrays(
         pandas_series,
         chunk_size=chunk_size,
         dtype_identity=dtype_identity,
         column=column_label,
         native_dtype=native_dtype,
     ):
+        null_count += chunk_null_count
+        if not len(tokens):
+            continue
         chunk_count += 1
         handler.add_canonical_array(tokens, row_positions=row_positions)
-
-    null_count = 0 if len(pandas_series) == 0 else int(pandas_series.isna().sum())
     if backend_metadata is None:
         from data_quality.intake import identify_backend
 
@@ -469,23 +486,34 @@ def _iter_pandas_canonical_arrays(
     dtype_identity: PandasDtypeIdentity | None = None,
     column: object | None = None,
     native_dtype: object | None = None,
-) -> Iterator[tuple[Any, Any]]:
-    """Yield non-null dtype-kernel tokens and original positional row indexes."""
+) -> Iterator[tuple[Any, Any, int]]:
+    """Yield non-null tokens, row positions, and per-chunk null counts."""
 
     pandas_module, numpy_module, pandas_series = _validate_pandas_series(series)
     chunk_size = _validate_chunk_size(chunk_size)
     effective_dtype = dtype_identity or identify_pandas_dtype(pandas_series.dtype)
     dtype_value = pandas_series.dtype if native_dtype is None else native_dtype
+    categorical_lookup = (
+        _new_categorical_token_lookup(pandas_series, numpy_module=numpy_module)
+        if effective_dtype.family is PandasDtypeFamily.CATEGORICAL
+        else None
+    )
 
     for start in range(0, len(pandas_series), chunk_size):
         chunk = pandas_series.iloc[start : start + chunk_size]
         null_mask = chunk.isna().to_numpy(dtype=bool, copy=False)
         included_mask = ~null_mask
+        chunk_null_count = int(null_mask.sum())
+        row_positions = start + numpy_module.flatnonzero(included_mask)
         if not bool(included_mask.any()):
+            yield (
+                numpy_module.empty(0, dtype=numpy_module.uint8),
+                row_positions,
+                chunk_null_count,
+            )
             continue
 
         values = chunk.array[included_mask]
-        row_positions = start + numpy_module.flatnonzero(included_mask)
         tokens = _canonicalize_pandas_ndarray(
             values,
             dtype_identity=effective_dtype,
@@ -494,8 +522,9 @@ def _iter_pandas_canonical_arrays(
             row_positions=row_positions,
             column=column if column is not None else pandas_series.name,
             native_dtype=dtype_value,
+            categorical_lookup=categorical_lookup,
         )
-        yield tokens, row_positions
+        yield tokens, row_positions, chunk_null_count
 
 
 def _canonicalize_pandas_ndarray(
@@ -507,6 +536,7 @@ def _canonicalize_pandas_ndarray(
     row_positions: object | None = None,
     column: object | None = None,
     native_dtype: object | None = None,
+    categorical_lookup: _CategoricalTokenLookup | None = None,
 ) -> Any:
     """Build exact-state tokens with dtype-specialised NumPy/pandas kernels."""
 
@@ -545,8 +575,25 @@ def _canonicalize_pandas_ndarray(
     if family is PandasDtypeFamily.CATEGORICAL:
         codes = getattr(values, "codes", None)
         if codes is None:  # pragma: no cover - pandas Categorical invariant
-            return numpy_module.asarray(array, dtype=object)
-        return numpy_module.asarray(codes, dtype=numpy_module.int64)
+            raise RuntimeError("pandas categorical values must expose category codes")
+        code_array = numpy_module.asarray(codes, dtype=numpy_module.int64)
+        if bool((code_array < 0).any()):  # pragma: no cover - nulls filtered upstream
+            raise RuntimeError("null categorical codes must be excluded before tokenization")
+
+        lookup = categorical_lookup or _new_categorical_token_lookup_from_values(
+            values,
+            numpy_module=numpy_module,
+        )
+        _resolve_categorical_tokens(
+            lookup,
+            code_array,
+            pandas_module=pandas_module,
+            numpy_module=numpy_module,
+            row_positions=row_positions,
+            column=column,
+            native_dtype=native_dtype,
+        )
+        return numpy_module.asarray(lookup.tokens[code_array], dtype=object)
 
     if family in {
         PandasDtypeFamily.DATETIME,
@@ -554,16 +601,12 @@ def _canonicalize_pandas_ndarray(
         PandasDtypeFamily.TIMEDELTA,
         PandasDtypeFamily.PERIOD,
     }:
-        asi8 = getattr(values, "asi8", None)
-        if asi8 is not None:
-            return numpy_module.asarray(asi8, dtype=numpy_module.int64)
-        if family is PandasDtypeFamily.PERIOD:
-            return numpy_module.asarray(
-                [cast(Any, value).ordinal for value in array],
-                dtype=numpy_module.int64,
-            )
-        temporal = pandas_module.Series(array)
-        return numpy_module.asarray(temporal.array.asi8, dtype=numpy_module.int64)
+        return _pandas_temporal_nanoseconds(
+            values,
+            family=family,
+            pandas_module=pandas_module,
+            numpy_module=numpy_module,
+        )
 
     if family is PandasDtypeFamily.INTERVAL:
         return numpy_module.asarray(array, dtype=object)
@@ -576,6 +619,39 @@ def _canonicalize_pandas_ndarray(
         column=column,
         native_dtype=native_dtype,
     )
+
+
+def _pandas_temporal_nanoseconds(
+    values: object,
+    *,
+    family: PandasDtypeFamily,
+    pandas_module: Any,
+    numpy_module: Any,
+) -> Any:
+    """Normalize pandas temporal tokens to signed int64 nanoseconds only."""
+
+    if family is PandasDtypeFamily.PERIOD:
+        period_array = values
+        start_time = getattr(period_array, "start_time", None)
+        if start_time is None:
+            period_array = pandas_module.PeriodIndex(values).array
+            start_time = period_array.start_time
+        normalized = start_time.as_unit("ns")
+        return numpy_module.asarray(normalized.asi8, dtype=numpy_module.int64)
+
+    as_unit = getattr(values, "as_unit", None)
+    if callable(as_unit):
+        normalized = as_unit("ns")
+        asi8 = getattr(normalized, "asi8", None)
+        if asi8 is None:  # pragma: no cover - pandas temporal-array invariant
+            raise RuntimeError("pandas temporal arrays must expose asi8 after ns conversion")
+        return numpy_module.asarray(asi8, dtype=numpy_module.int64)
+
+    if family is PandasDtypeFamily.TIMEDELTA:
+        normalized = pandas_module.to_timedelta(values).as_unit("ns")
+    else:
+        normalized = pandas_module.DatetimeIndex(values).as_unit("ns")
+    return numpy_module.asarray(normalized.asi8, dtype=numpy_module.int64)
 
 
 def _scalar_fallback_array(
@@ -612,6 +688,88 @@ def _scalar_fallback_array(
     return canonical
 
 
+def _new_categorical_token_lookup(
+    pandas_series: Any,
+    *,
+    numpy_module: Any,
+) -> _CategoricalTokenLookup:
+    categories = pandas_series.cat.categories
+    return _categorical_token_lookup(categories, numpy_module=numpy_module)
+
+
+def _new_categorical_token_lookup_from_values(
+    values: Any,
+    *,
+    numpy_module: Any,
+) -> _CategoricalTokenLookup:
+    categories = getattr(values, "categories", None)
+    if categories is None:  # pragma: no cover - pandas Categorical invariant
+        raise RuntimeError("pandas categorical values must expose categories")
+    return _categorical_token_lookup(categories, numpy_module=numpy_module)
+
+
+def _categorical_token_lookup(
+    categories: Any,
+    *,
+    numpy_module: Any,
+) -> _CategoricalTokenLookup:
+    category_count = len(categories)
+    return _CategoricalTokenLookup(
+        categories=categories,
+        tokens=numpy_module.empty(category_count, dtype=object),
+        resolved=numpy_module.zeros(category_count, dtype=bool),
+    )
+
+
+def _resolve_categorical_tokens(
+    lookup: _CategoricalTokenLookup,
+    codes: Any,
+    *,
+    pandas_module: Any,
+    numpy_module: Any,
+    row_positions: object | None,
+    column: object | None,
+    native_dtype: object | None,
+) -> None:
+    """Canonicalise each used category value once, independent of category order."""
+
+    used_codes = numpy_module.unique(codes)
+    unresolved_codes = used_codes[~lookup.resolved[used_codes]]
+    if unresolved_codes.size == 0:
+        return
+
+    positions = (
+        None
+        if row_positions is None
+        else numpy_module.asarray(row_positions, dtype=numpy_module.int64)
+    )
+    for raw_code in unresolved_codes:
+        code = int(raw_code)
+        value = lookup.categories[code]
+        try:
+            token = _canonicalize_pandas_logical_scalar(
+                value,
+                pandas_module=pandas_module,
+                numpy_module=numpy_module,
+            )
+        except TypeError as error:
+            local_matches = numpy_module.flatnonzero(codes == code)
+            row_position = (
+                None
+                if positions is None or local_matches.size == 0
+                else int(positions[int(local_matches[0])])
+            )
+            raise UnsupportedCardinalityValueError(
+                backend="pandas",
+                column=column,
+                native_dtype=str(native_dtype),
+                row_position=row_position,
+                value=value,
+            ) from error
+        lookup.tokens[code] = token
+        lookup.resolved[code] = True
+
+
 def _canonicalize_pandas_scalar(
     value: object,
     *,
@@ -620,30 +778,50 @@ def _canonicalize_pandas_scalar(
 ) -> bytes:
     """Normalise pandas/NumPy scalar wrappers for mixed/object fallback only."""
 
+    return _canonicalize_pandas_logical_scalar(
+        value,
+        pandas_module=pandas_module,
+        numpy_module=numpy_module,
+    )
+
+
+def _canonicalize_pandas_logical_scalar(
+    value: object,
+    *,
+    pandas_module: Any,
+    numpy_module: Any,
+) -> bytes:
+    """Canonicalise one pandas/NumPy logical scalar without using ``repr``."""
+
     if isinstance(value, pandas_module.Timestamp):
         if value.tzinfo is not None:
             value = value.tz_convert("UTC")
-            return b"ta" + value.isoformat().encode("ascii")
-        return b"tn" + value.isoformat().encode("ascii")
+            prefix = b"ta"
+        else:
+            prefix = b"tn"
+        nanoseconds = int(value.as_unit("ns").value)
+        return prefix + str(nanoseconds).encode("ascii")
 
     if isinstance(value, pandas_module.Timedelta):
-        return b"u" + str(int(value.value)).encode("ascii")
+        nanoseconds = int(value.as_unit("ns").value)
+        return b"u" + str(nanoseconds).encode("ascii")
 
     if isinstance(value, pandas_module.Period):
+        start_nanoseconds = int(value.start_time.as_unit("ns").value)
         return (
             b"p"
             + str(value.freqstr).encode("ascii")
             + b":"
-            + str(value.ordinal).encode("ascii")
+            + str(start_nanoseconds).encode("ascii")
         )
 
     if isinstance(value, pandas_module.Interval):
-        left = _canonicalize_pandas_scalar(
+        left = _canonicalize_pandas_logical_scalar(
             value.left,
             pandas_module=pandas_module,
             numpy_module=numpy_module,
         )
-        right = _canonicalize_pandas_scalar(
+        right = _canonicalize_pandas_logical_scalar(
             value.right,
             pandas_module=pandas_module,
             numpy_module=numpy_module,
@@ -659,14 +837,14 @@ def _canonicalize_pandas_scalar(
         )
 
     if isinstance(value, numpy_module.datetime64):
-        return _canonicalize_pandas_scalar(
+        return _canonicalize_pandas_logical_scalar(
             pandas_module.Timestamp(value),
             pandas_module=pandas_module,
             numpy_module=numpy_module,
         )
 
     if isinstance(value, numpy_module.timedelta64):
-        return _canonicalize_pandas_scalar(
+        return _canonicalize_pandas_logical_scalar(
             pandas_module.Timedelta(value),
             pandas_module=pandas_module,
             numpy_module=numpy_module,
@@ -674,7 +852,9 @@ def _canonicalize_pandas_scalar(
 
     if isinstance(value, numpy_module.bool_):
         value = bool(value)
-    elif isinstance(value, numpy_module.integer):
+    elif isinstance(value, numpy_module.unsignedinteger):
+        return b"iu" + str(int(value)).encode("ascii")
+    elif isinstance(value, numpy_module.signedinteger):
         value = int(value)
     elif isinstance(value, numpy_module.floating):
         value = float(value)
@@ -696,7 +876,15 @@ def _pandas_hash_kernel(
     if family is PandasDtypeFamily.BOOLEAN:
         return PandasHashKernel("pandas-boolean-v1", "numpy_bool_array")
     if family is PandasDtypeFamily.INTEGER:
-        return PandasHashKernel("pandas-integer-v1", "numpy_integer_array")
+        if dtype_identity.integer_signedness == "unsigned":
+            return PandasHashKernel(
+                "pandas-unsigned-integer-v2",
+                "numpy_unsigned_integer_array",
+            )
+        return PandasHashKernel(
+            "pandas-signed-integer-v2",
+            "numpy_signed_integer_array",
+        )
     if family is PandasDtypeFamily.FLOATING:
         return PandasHashKernel("pandas-float64-v1", "numpy_float64_array")
     if family is PandasDtypeFamily.COMPLEX:
@@ -704,22 +892,21 @@ def _pandas_hash_kernel(
     if family is PandasDtypeFamily.STRING:
         return PandasHashKernel("pandas-string-v1", "numpy_object_string_array")
     if family is PandasDtypeFamily.CATEGORICAL:
-        category_signature = _categorical_signature(native_dtype)
         return PandasHashKernel(
-            f"pandas-categorical-codes-v1:{category_signature}",
-            "numpy_int64_categorical_codes",
+            "pandas-categorical-value-token-v2",
+            "numpy_object_categorical_value_tokens",
         )
     if family is PandasDtypeFamily.DATETIME:
-        return PandasHashKernel("pandas-datetime-ns-v1", "numpy_int64_nanoseconds")
+        return PandasHashKernel("pandas-datetime-ns-v2", "numpy_int64_nanoseconds")
     if family is PandasDtypeFamily.DATETIME_TZ:
-        return PandasHashKernel("pandas-datetime-utc-ns-v1", "numpy_int64_utc_nanoseconds")
+        return PandasHashKernel("pandas-datetime-utc-ns-v2", "numpy_int64_utc_nanoseconds")
     if family is PandasDtypeFamily.TIMEDELTA:
-        return PandasHashKernel("pandas-timedelta-ns-v1", "numpy_int64_nanoseconds")
+        return PandasHashKernel("pandas-timedelta-ns-v2", "numpy_int64_nanoseconds")
     if family is PandasDtypeFamily.PERIOD:
         frequency = str(getattr(native_dtype, "freq", native_dtype))
         return PandasHashKernel(
-            f"pandas-period-ordinal-v1:{frequency}",
-            "numpy_int64_period_ordinals",
+            f"pandas-period-start-ns-v2:{frequency}",
+            "numpy_int64_period_start_nanoseconds",
         )
     if family is PandasDtypeFamily.INTERVAL:
         subtype = str(getattr(native_dtype, "subtype", "unknown"))
@@ -733,14 +920,6 @@ def _pandas_hash_kernel(
         "numpy_object_array_of_canonical_bytes",
         scalar_fallback=True,
     )
-
-
-def _categorical_signature(native_dtype: object) -> str:
-    categories = getattr(native_dtype, "categories", None)
-    ordered = bool(getattr(native_dtype, "ordered", False))
-    payload = f"{repr(categories)}|ordered={ordered}".encode("utf-8")
-    return hashlib.blake2b(payload, digest_size=8, person=b"dq-cat-v1").hexdigest()
-
 
 def _pandas_result_warnings(
     *,
