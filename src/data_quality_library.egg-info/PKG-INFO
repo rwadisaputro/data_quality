@@ -1,3 +1,30 @@
+Metadata-Version: 2.4
+Name: data-quality-library
+Version: 0.2.0
+Summary: Native dataframe intake and physical-schema discovery for a data-quality profiler
+Author: Jek n Jok
+License: Proprietary
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: pandas
+Requires-Dist: pandas>=2.2; extra == "pandas"
+Requires-Dist: numpy>=1.26; extra == "pandas"
+Provides-Extra: polars
+Requires-Dist: polars>=1.0; extra == "polars"
+Provides-Extra: pyspark
+Requires-Dist: pyspark>=3.4; extra == "pyspark"
+Provides-Extra: all-backends
+Requires-Dist: pandas>=2.2; extra == "all-backends"
+Requires-Dist: polars>=1.0; extra == "all-backends"
+Requires-Dist: pyspark>=3.4; extra == "all-backends"
+Provides-Extra: test
+Requires-Dist: pytest>=8.0; extra == "test"
+Requires-Dist: pytest-cov>=5.0; extra == "test"
+Requires-Dist: mypy>=1.11; extra == "test"
+Requires-Dist: ruff>=0.9; extra == "test"
+Requires-Dist: pandas>=2.2; extra == "test"
+Requires-Dist: numpy>=1.26; extra == "test"
+
 # Dataframe intake, backend identification and physical-schema discovery
 
 This package implements the first three stages of the profiling pipeline:

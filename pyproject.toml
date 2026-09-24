@@ -13,11 +13,11 @@ authors = [{ name = "Jek n Jok" }]
 dependencies = []
 
 [project.optional-dependencies]
-pandas = ["pandas>=2.2"]
+pandas = ["pandas>=2.2", "numpy>=1.26"]
 polars = ["polars>=1.0"]
 pyspark = ["pyspark>=3.4"]
 all-backends = ["pandas>=2.2", "polars>=1.0", "pyspark>=3.4"]
-test = ["pytest>=8.0", "pytest-cov>=5.0", "mypy>=1.11", "ruff>=0.9"]
+test = ["pytest>=8.0", "pytest-cov>=5.0", "mypy>=1.11", "ruff>=0.9", "pandas>=2.2", "numpy>=1.26"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
