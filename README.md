@@ -383,6 +383,14 @@ The adaptive state starts with exact canonical uniques and promotes one-way to c
 64-bit HyperLogLog only after a configured exact-state threshold is exceeded. The default
 limits are 50,000 exact unique values or 32 MiB of retained exact-state memory.
 
+The local adaptive handler keeps its retained exact values sorted. Before sorting or merging
+an incoming interval, it first checks which values are absent from that retained state.
+Duplicate-only intervals therefore skip `np.unique`, merge allocation, exact-memory
+remeasurement, and promotion work. When new values are present, only those additions are
+uniqued and their memory contribution is accounted incrementally. Promotion-boundary
+telemetry is derived from first occurrences without repeatedly rebuilding full candidate
+unions.
+
 If the exact state never exceeds either threshold, the JSON reports an exact result. After
 promotion, the retained exact uniques are hashed into HLL once, the exact state is released,
 and all later values update only the HLL sketch. Promotion is permanent.
@@ -393,48 +401,53 @@ When HLL is used, the unrounded floating estimator remains available as
 exact/approximate method, row/null metrics, all adaptive thresholds, HLL
 precision/register/RSE metadata, complete hash configuration,
 peak exact-state usage, promotion reason and row position, the full `BackendIdentity` from
-`identify_backend`, pandas dtype metadata and dtype family, NumPy version, and execution
+`identify_backend`, backend dtype metadata and dtype family, runtime versions, and execution
 parameters.
 
 ### pandas dtype-specialised ndarray hashing path
 
 Pandas dtype metadata is inspected before value processing. Homogeneous native dtypes use
-backend-specific ndarray kernels rather than scalar canonicalisation:
+backend-specific ndarray kernels rather than row-by-row scalar canonicalisation:
 
 - boolean -> NumPy boolean array;
-- integer -> native signed/unsigned integer array;
+- signed integer -> native signed integer array with a signed-integer kernel contract;
+- unsigned integer -> native unsigned integer array with a distinct unsigned-integer kernel
+  contract, preserving values above `2**63 - 1`;
 - floating -> normalised `float64` array;
 - complex -> normalised `complex128` array;
 - pandas string -> object string ndarray without scalar conversion;
-- categorical -> exact category-code array with a category-signature kernel id;
-- datetime / datetime-with-timezone -> nanosecond `int64` values, with timezone-aware
-  values represented as UTC instants;
-- timedelta -> nanosecond `int64` values;
-- period -> ordinal `int64` values plus frequency in the kernel id;
+- categorical -> category codes are used only as local dictionary indexes and resolve to
+  canonical category-value tokens; category dictionary order and `ordered=True/False` do
+  not define hash identity;
+- datetime / datetime-with-timezone -> explicitly normalised nanosecond `int64` values,
+  with timezone-aware values represented as UTC instants;
+- timedelta -> explicitly normalised nanosecond `int64` values;
+- period -> nanosecond temporal identity with frequency-specific kernel metadata;
 - interval -> native interval object ndarray hashed in bulk.
 
 Only `object` and otherwise-unclassified pandas dtypes use the type-aware scalar
-canonicaliser. That fallback is explicit in result lineage and emits a structured
-`scalar_canonicalization_fallback` performance warning. If the fallback encounters an
-unsupported logical scalar, a single-column call raises `UnsupportedCardinalityValueError`
-with machine-readable context. A dataframe-wide call isolates that column, records an
-`unsupported_cardinality_scalar` error for it, and continues profiling other columns.
+canonicaliser. Decimal values in that path are decoded with `Decimal.as_tuple()`; coefficient
+trailing zeros are removed with integer/digit operations while compensating the exponent, so
+canonicalisation performs no context-dependent Decimal rounding. Arbitrary object `repr()`
+is not used as a cardinality identity fallback. Unsupported logical scalars are surfaced as
+structured diagnostics.
 
-Every hashing kernel produces `np.uint64` arrays through `pandas.util.hash_array` followed
-by a vectorised SplitMix64 finaliser. The finaliser incorporates the configured 64-bit seed
-and a stable dtype-kernel salt, including for numeric pandas hashes where `hash_key` alone
-does not affect the native hash. HLL register updates consume those arrays in bulk via the
-NumPy update path.
+Each pandas chunk already needs a null mask to exclude null-like values. The adapter reuses
+that mask to accumulate null counts rather than performing a second full-column
+`Series.isna().sum()` scan. Floating-point `-0.0` and `0.0` are normalised together.
 
-The hash contract is versioned as `pandas-dtype-kernel-64-v2`. The selected kernel id is
-bound into `HashConfiguration.canonicalisation_version`, so sketches produced under
-incompatible dtype semantics are rejected during merge. The adaptive/HLL core remains
-backend-neutral: pandas supplies canonical exact-state ndarrays plus an ndarray hasher.
+Every pandas hashing kernel produces `np.uint64` arrays through `pandas.util.hash_array`
+followed by a vectorised SplitMix64 finaliser. The finaliser incorporates the configured
+64-bit seed and a stable dtype-kernel salt, including for numeric pandas hashes where
+`hash_key` alone does not affect the native hash. HLL register updates consume those arrays
+in bulk via the NumPy update path.
 
-Null-like values detected by `Series.isna()` are excluded from cardinality. Floating-point
-`-0.0` and `0.0` are normalised together. Mixed `object` columns retain the scalar
-canonicaliser's type-aware distinction between integer `1`, boolean `True`, float `1.0`,
-and string `"1"`.
+Hash compatibility is an explicit immutable binding contract. A supported unbound
+`HashConfiguration` can be bound once to a concrete hashing runtime/version and kernel;
+rebinding the same contract is idempotent, while a different runtime, runtime version,
+kernel, hashing engine, or unsupported canonicalisation version is rejected. The pandas
+canonicalisation contract is `pandas-dtype-kernels-v3`; the selected kernel is recorded
+separately in `HashConfiguration.kernel_id`.
 
 The lower-level pandas HLL-only APIs are also DataFrame-first. Callers pass the native
 DataFrame plus a column label; Series objects are only created internally after backend and
@@ -447,9 +460,9 @@ estimate = pandas_hll_nunique(sample_dataframe, "customer_id", precision=14)
 sketch = pandas_hll_sketch(sample_dataframe, "customer_id", precision=14)
 ```
 
-Configured sketches carry their hash seed, engine, and canonicalisation metadata. A merge
-is rejected when those configurations differ, preventing sketches built under incompatible
-equality/hash semantics from being silently combined.
+Configured sketches carry their seed, algorithm/engine, canonicalisation version, hashing
+runtime/version, and kernel id. A merge is rejected when those contracts differ, preventing
+sketches built under incompatible equality/hash semantics from being silently combined.
 
 ### Cardinality test coverage
 

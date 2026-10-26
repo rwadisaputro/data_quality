@@ -32,7 +32,7 @@ Support:
 ADAPTIVE_PREFERRED   # default
 EXACT_ONLY
 HLL_ONLY
-TWO_STAGE            # fallback when adaptive state is impossible
+TWO_STAGE            # exact-first distributed fallback when in-place promotion is impossible
 ```
 
 ### Adaptive mode
@@ -43,17 +43,18 @@ Promote to HLL only if the exact state exceeds a configured limit.
 
 ### Two-stage fallback
 
-If the execution engine cannot dynamically promote aggregate state:
+If the execution engine cannot dynamically promote aggregate state, preserve the same exact-first policy with bounded discovery:
 
 ```text
-pass 1: HLL estimate + row/null metrics
+pass 1: row/null metrics + bounded distinct discovery
+        distinct().limit(exact_threshold + 1)
     ↓
-decide whether exact counting is safe
-    ↓
-pass 2: exact count only for selected low-cardinality columns
+exact state within unique-count and memory limits?
+    ├─ yes → exact result
+    └─ no  → pass 2: distributed HLL register aggregation
 ```
 
-Never calculate a complete exact distinct set and then run HLL afterward.
+The current PySpark implementation follows this strategy. It must not collect the complete source column or an unbounded distinct set to the driver.
 
 ---
 
@@ -72,6 +73,14 @@ and guarantee:
 $$
 C_{\text{exact}}(x)=C_{\text{HLL}}(x)
 $$
+
+Required implementation constraints:
+
+- signed and unsigned integer families use distinct canonical/hash contracts; never cast the full unsigned domain through signed `int64`;
+- finite `Decimal` canonicalisation uses `Decimal.as_tuple()` and coefficient/exponent integer operations, not context-dependent normalization or rounding;
+- temporal kernels normalize logical values to nanoseconds before integer identity is used;
+- categorical dictionary codes are not portable identities; resolve codes through canonical category values, independent of dictionary order and the pandas `ordered` flag;
+- arbitrary `repr()` output must not define equality/hash identity.
 
 Use type-aware encoding so values such as:
 
@@ -125,9 +134,15 @@ hash_seed
 canonicalisation_version
 ```
 
-Prefer a mature HLL/HLL++ implementation with its own tested hash/estimator behavior.
+The current implementation uses the project-owned classic 64-bit HLL estimator plus Linear Counting. HLL++ bias tables and sparse representation are not part of the current algorithm contract.
 
 Do not merge sketches whose hash or canonicalization semantics differ.
+
+Hash configuration binding is enforced:
+
+- binding a supported unbound configuration to a kernel produces a bound configuration;
+- binding that configuration to the same runtime/version/kernel again is idempotent;
+- rebinding to another kernel, runtime, runtime version, hashing engine, or unsupported canonicalisation version raises an error.
 
 ---
 
@@ -441,42 +456,22 @@ null/equality semantics
 
 ## 11. Two-stage routing rule
 
-When adaptive state is unavailable, use HLL first.
+When in-place adaptive state is unavailable, use bounded **exact-first** discovery.
 
-If the HLL implementation provides an upper bound, use it for planning.
+For the current PySpark strategy:
 
-Otherwise a conservative routing heuristic may be:
+```text
+1. Compute row/null metrics in Spark SQL.
+2. Build native normalized values for the selected dtype.
+3. Evaluate distinct().limit(exact_unique_threshold + 1).
+4. Estimate the retained candidate-state memory under the configured safety factor.
+5. If neither exact threshold is exceeded, return the exact candidate count.
+6. Otherwise compute xxhash64, register index, and rho in Spark SQL.
+7. groupBy(register).max(rho).
+8. Collect at most 2^p register/rank summaries and merge them into the shared HLL sketch.
+```
 
-$$
-U_{\text{planning}}
-=
-\hat U(1+z\cdot\operatorname{RSE})
-$$
-
-Estimate exact-state memory:
-
-$$
-B_{\text{planning}}
-=
-U_{\text{planning}}
-\left(
-\bar B_{\text{value}}
-+
-B_{\text{entry overhead}}
-\right)
-$$
-
-Run exact count only when both are satisfied:
-
-$$
-U_{\text{planning}}\le U_{\max}
-$$
-
-$$
-B_{\text{planning}}\le B_{\max}
-$$
-
-This fallback requires replayable input.
+This rule avoids an HLL-first planning pass, avoids unbounded driver collection, and preserves the same exact-versus-approximate policy as the local adaptive handler. Because distributed distinct discovery loses source ordering, promotion row positions are not reported for this path.
 
 ---
 

@@ -267,6 +267,14 @@ The exact counter and HLL must use the **same converted representation**.
 
 Otherwise they could disagree about what counts as the same value.
 
+Current canonicalisation invariants include:
+
+- signed and unsigned integer domains are distinct; unsigned values are not forced through `int64`;
+- Decimal values use `as_tuple()` and remove coefficient trailing zeros without context-dependent decimal arithmetic;
+- temporal kernels normalize equivalent values to nanosecond identity;
+- categorical codes are only local lookup indexes, while canonical category values define portable identity;
+- arbitrary `repr()` output is not a stable identity contract.
+
 ---
 
 ## 8. Null handling
@@ -313,7 +321,7 @@ Store this information as metadata.
 
 Do not merge two HLL sketches if they were created using incompatible hashing or normalization rules.
 
-Use a mature HLL/HLL++ implementation rather than building the hashing and estimator logic from scratch unless there is a strong engineering reason to do so.
+The current library intentionally uses its own classic 64-bit HyperLogLog implementation with Linear Counting for the small-cardinality range so every backend shares one estimator contract. HLL++ empirical bias correction and sparse representation are not implemented. Replacing the estimator later is a design/compatibility change, not a transparent implementation swap.
 
 ---
 
@@ -440,29 +448,29 @@ This mergeability is one of HLL's major strengths in distributed systems. HLL sk
 
 ## 13. Fallback when the backend cannot switch from exact to HLL mid-process
 
-Some execution systems may not allow an aggregation to start as exact and dynamically become HLL.
-
-For those systems, use a two-stage fallback:
+Some distributed execution systems cannot mutate one aggregate from an exact Python state into an HLL state while the same query is running. The current PySpark adapter therefore uses an **exact-first two-stage strategy** rather than an HLL-first planning pass.
 
 ```text
 Stage 1
-Run HLL to estimate cardinality
-and collect row/null metrics
+Compute row/null metrics in Spark SQL
+and perform bounded distributed distinct discovery
+with distinct().limit(exact_threshold + 1)
     ↓
-Decide whether exact counting is likely to be cheap
-    ↓
-Stage 2
-Run exact distinct count only for safe low-cardinality columns
+Exact state still fits the configured limits?
+    ├─ Yes → return the exact result
+    └─ No  → Stage 2
+              compute xxhash64/register/rho in Spark SQL
+              group by register and keep max(rho)
+              collect at most 2^p register summaries
+              finish with the shared classic HLL estimator
 ```
 
-This can require reading selected columns a second time.
+This preserves the library's "exact when cheap, approximate when necessary" policy without collecting the full source column to the driver. It can require more than one distributed job, so that cost is exposed in execution lineage rather than hidden.
 
-Therefore it is a fallback, not the preferred design.
-
-The preferred design remains:
+For local backends, the preferred design remains:
 
 ```text
-one pass
+one bounded stream
 start exact
 promote to HLL only when needed
 ```

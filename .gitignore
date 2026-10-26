@@ -1,0 +1,38 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging / build artifacts
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter checkpoints and local validation notebooks
+.ipynb_checkpoints/
+cardinality-smoke-tests.ipynb
+cardinality_manual_validation_tests.ipynb
+cardinality_polars_pyspark_validation.ipynb
+milestone9_manual_validation_tests.ipynb
+polars_pyspark_integration_validation.ipynb
+
+# OneDrive / conflict copies
+*-NealleROG*
+
+# Local reference papers used during implementation
+src/data_quality/cardinality/tmp/*.pdf
+
+# Patch helper files
+_patch_tools/
